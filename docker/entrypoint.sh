@@ -107,23 +107,26 @@ done
 # then "CUDA compiler and toolkit headers are incompatible" on the
 # mixed cuda-nvcc 13.3 / cuda-runtime 13.0 wheel combo).
 #
-# Auto-set CUDA_HOME if a pip-installed nvcc is present, and disable the
-# FlashInfer JIT sampler — sampler only, no impact on attention path.
-# No-op when vllm isn't installed.
+# Auto-set CUDA_HOME from pip only as a fallback when the image/host does not
+# already provide a working toolkit. The Docker image ships a complete CUDA
+# toolkit under /usr/local/cuda-13.3; replacing that CUDA_HOME with a pip wheel
+# tree can make CMake find nvcc but fail to resolve CUDA_CUDART.
 #
 # Checked layouts (all are real pip-wheel install paths):
 #   nvidia/cu13        — nvidia-nvcc-cu13 (CUDA 13.x wheel style)
 #   nvidia/cu12        — nvidia-nvcc-cu12 (CUDA 12.x wheel style)
 #   nvidia/cuda_nvcc   — nvidia-cuda-nvcc-cu12 (older cu12 sub-package style)
-for cu in \
-    /app/.local/lib/python*/site-packages/nvidia/cu13 \
-    /app/.local/lib/python*/site-packages/nvidia/cu12 \
-    /app/.local/lib/python*/site-packages/nvidia/cuda_nvcc; do
-    if [ -x "$cu/bin/nvcc" ]; then
-        export CUDA_HOME="$cu"
-        break
-    fi
-done
+if [ ! -x "${CUDA_HOME:-}/bin/nvcc" ]; then
+    for cu in \
+        /app/.local/lib/python*/site-packages/nvidia/cu13 \
+        /app/.local/lib/python*/site-packages/nvidia/cu12 \
+        /app/.local/lib/python*/site-packages/nvidia/cuda_nvcc; do
+        if [ -x "$cu/bin/nvcc" ]; then
+            export CUDA_HOME="$cu"
+            break
+        fi
+    done
+fi
 
 # Disable the FlashInfer JIT sampler unconditionally — it is sampler-only
 # and has no impact on the attention path, but requires nvcc + matching

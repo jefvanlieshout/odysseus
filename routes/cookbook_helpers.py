@@ -911,7 +911,7 @@ def _append_llama_cpp_linux_accel_build_lines(runner_lines: list[str]) -> None:
     runner_lines.append('      lspci 2>/dev/null | grep -iE \'VGA|3D|Display\' | grep -iq nvidia && return 0')
     runner_lines.append('      return 1')
     runner_lines.append('    }')
-    runner_lines.append('    if _odysseus_has_nvidia_hw; then')
+    runner_lines.append('    if _odysseus_has_nvidia_hw && ! command -v nvcc >/dev/null 2>&1; then')
     runner_lines.append('      for _cudir in ~/.local/lib/python*/site-packages/nvidia/cu13 ~/.local/lib/python*/site-packages/nvidia/cu12 ~/.local/lib/python*/site-packages/nvidia/cuda_nvcc; do')
     runner_lines.append('        [ -x "$_cudir/bin/nvcc" ] && export CUDA_HOME="$_cudir" && export PATH="$_cudir/bin:$PATH" && break')
     runner_lines.append('      done')
