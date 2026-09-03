@@ -62,3 +62,11 @@ Do not blindly pull an upstream development branch into `assistant-main`. Treat 
 ## Notification policy (v0.1.3)
 
 Notifications use state-aware duplicate suppression rather than a blanket time cooldown. Persistent reminders may be unconditional or tied to an active condition fingerprint.
+
+### Reminder MCP bridge
+
+From assistant version 0.1.4, Qwen reaches reminders through Odysseus's native
+MCP manager rather than a custom patch to the agent loop. `./reminders.sh
+install` places a runtime copy under Odysseus's persistent data mount, registers
+the stdio MCP server, and restarts Odysseus so the tools are discovered. The
+MCP adapter can request reminders but does not schedule or deliver them itself.

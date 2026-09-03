@@ -14,7 +14,28 @@ TELEGRAM_ENV="$TELEGRAM_DIR/.env"
 COMPOSE_FILE="$ROOT/docker-compose.assistant.yml"
 EVENTS_URL="${EVENTS_URL:-http://127.0.0.1:8780}"
 
-compose() { docker compose -f "$COMPOSE_FILE" "$@"; }
+odysseus_container() {
+  docker ps --filter 'label=com.docker.compose.service=odysseus' --format '{{.ID}}' | head -n1
+}
+
+odysseus_network() {
+  local cid project candidate
+  cid="$(odysseus_container)"
+  [[ -n "$cid" ]] || { printf '%s\n' "${ODYSSEUS_DOCKER_NETWORK:-odysseus_default}"; return 0; }
+  project="$(docker inspect "$cid" --format '{{ index .Config.Labels "com.docker.compose.project" }}')"
+  candidate="${project}_default"
+  if docker network inspect "$candidate" >/dev/null 2>&1; then
+    printf '%s\n' "$candidate"
+  else
+    docker inspect "$cid" --format '{{range $name, $cfg := .NetworkSettings.Networks}}{{println $name}}{{end}}' | head -n1
+  fi
+}
+
+compose() {
+  local network
+  network="${ODYSSEUS_DOCKER_NETWORK:-$(odysseus_network)}"
+  ODYSSEUS_DOCKER_NETWORK="$network" docker compose -f "$COMPOSE_FILE" "$@"
+}
 
 env_get() {
   local file="$1" key="$2"

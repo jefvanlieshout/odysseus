@@ -20,3 +20,15 @@ Root helper commands:
 ```
 
 Architectural rule: models reason/propose; the Python/controller layer is authoritative about permissions, external actions, schedules, and what actually happened.
+
+## Qwen reminder tools (v0.1.4)
+
+`assistant/mcp/reminders_server.py` is a thin stdio MCP bridge. Install/refresh it with:
+
+```bash
+./reminders.sh install
+```
+
+Odysseus/Qwen then gets structured create/list/cancel reminder tools. The MCP
+bridge does not own timers or Telegram delivery; it calls `assistant-events`,
+which remains the authoritative scheduler and event database.

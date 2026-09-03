@@ -18,6 +18,9 @@ services:
     ports:
       - "127.0.0.1:8780:8780"
     restart: unless-stopped
+    networks:
+      - default
+      - odysseus-shared
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -26,3 +29,8 @@ services:
 
 volumes:
   assistant-events-data:
+
+networks:
+  odysseus-shared:
+    external: true
+    name: ${ODYSSEUS_DOCKER_NETWORK:-odysseus_default}
