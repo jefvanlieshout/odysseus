@@ -13,7 +13,7 @@ curl --fail-with-body -sS \
     "severity": "info",
     "state": "info",
     "title": "Outbound notifications are working",
-    "message": "Hello Jef. The new event system delivered this without asking Qwen to do anything.",
+    "message": "Hello Jef. The event system delivered this without asking Qwen to do anything.",
     "target": "telegram",
     "actor_id": "system",
     "agent_id": "main",

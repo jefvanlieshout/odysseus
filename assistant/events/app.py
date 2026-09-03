@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sqlite3
+import tomllib
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -26,7 +27,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger("assistant-events")
 
-APP_NAME = os.getenv("ASSISTANT_NAME", "Jarvis").strip() or "Assistant"
+IDENTITY_PATH = Path(os.getenv("ASSISTANT_IDENTITY_PATH", "/config/identity.toml"))
+
+
+def load_identity() -> tuple[str, str]:
+    fallback_name = os.getenv("ASSISTANT_NAME", "Assistant").strip() or "Assistant"
+    fallback_id = os.getenv("ASSISTANT_INTERNAL_ID", "main").strip() or "main"
+    try:
+        data = tomllib.loads(IDENTITY_PATH.read_text(encoding="utf-8"))
+        assistant = data.get("assistant", {})
+        display_name = str(assistant.get("display_name", fallback_name)).strip() or fallback_name
+        internal_id = str(assistant.get("internal_id", fallback_id)).strip() or fallback_id
+        return display_name, internal_id
+    except FileNotFoundError:
+        logger.warning("Assistant identity file not found at %s; using environment fallbacks", IDENTITY_PATH)
+    except Exception:
+        logger.exception("Could not read assistant identity file %s; using environment fallbacks", IDENTITY_PATH)
+    return fallback_name, fallback_id
+
+
+def private_chat_fallback(raw_allowed_users: str) -> str:
+    # For a one-to-one Telegram bot conversation, the private chat ID is the
+    # user's Telegram ID. Only infer this when there is exactly one allowlisted
+    # user. Groups/multiple users must set TELEGRAM_CHAT_ID explicitly.
+    ids: list[str] = []
+    for item in raw_allowed_users.replace(" ", ",").split(","):
+        item = item.strip()
+        if item and item.lstrip("-").isdigit() and item not in ids:
+            ids.append(item)
+    return ids[0] if len(ids) == 1 else ""
+
+
+APP_NAME, ASSISTANT_INTERNAL_ID = load_identity()
 API_KEY = os.getenv("EVENTS_API_KEY", "").strip()
 DATA_DIR = Path(os.getenv("EVENTS_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "events.db"
@@ -35,6 +67,8 @@ MAX_EVENT_MESSAGE_CHARS = max(200, int(os.getenv("EVENTS_MAX_MESSAGE_CHARS", "35
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+if not TELEGRAM_CHAT_ID:
+    TELEGRAM_CHAT_ID = private_chat_fallback(os.getenv("TELEGRAM_ALLOWED_USER_IDS", ""))
 TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 TELEGRAM_TIMEOUT_SECONDS = float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "20"))
 
@@ -449,7 +483,7 @@ async def lifespan(app: FastAPI):
         SINKS[_telegram_sink.name] = _telegram_sink
         logger.info("Telegram notification sink enabled for chat_id=%s", TELEGRAM_CHAT_ID)
     else:
-        logger.warning("Telegram sink disabled: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing")
+        logger.warning("Telegram sink disabled: bot token/chat ID unavailable. With one private allowlisted Telegram user, the chat ID is inferred automatically; otherwise set TELEGRAM_CHAT_ID in assistant/events/.env")
 
     if not API_KEY:
         logger.error("EVENTS_API_KEY is empty; authenticated endpoints will refuse requests")
@@ -471,7 +505,7 @@ async def lifespan(app: FastAPI):
         SINKS.clear()
 
 
-app = FastAPI(title="Assistant Events", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Assistant Events", version="0.1.2", lifespan=lifespan)
 
 
 @app.get("/health", response_model=HealthResult)
