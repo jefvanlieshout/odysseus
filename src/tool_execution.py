@@ -952,6 +952,54 @@ async def _execute_tool_block_impl(
     elif tool in ("pipeline", "manage_memory", "ui_control"):
         from src.ai_interaction import dispatch_ai_tool
         desc, result = await dispatch_ai_tool(tool, content, session_id, owner=owner)
+    elif tool == "discover_tools":
+        desc = "discover_tools"
+        raw = (content or "").strip()
+        args = {}
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    args = parsed
+            except (json.JSONDecodeError, TypeError):
+                args = {"query": raw}
+
+        query = str(args.get("query") or "").strip()
+        try:
+            limit = max(1, min(int(args.get("limit") or 8), 12))
+        except (TypeError, ValueError):
+            limit = 8
+
+        if not query:
+            result = {
+                "error": "discover_tools requires a non-empty capability query.",
+                "exit_code": 1,
+            }
+        else:
+            from assistant.fork.tool_broker_runtime import discover_runtime_tools
+
+            discovered = discover_runtime_tools(
+                query=query,
+                disabled_tools=disabled_tools or (),
+                mcp_mgr=get_mcp_manager(),
+                max_results=limit,
+            )
+            payload = {
+                "query": query,
+                "discovered_tools": list(discovered),
+                "note": (
+                    "Only names in discovered_tools were returned by THIS discovery "
+                    "call. Do not claim any other tool was discovered by it. Other tools "
+                    "may already be visible separately. Discovery only changes visibility; "
+                    "the controller still enforces disabled tools, permissions, approvals, "
+                    "and execution policy."
+                ),
+            }
+            result = {
+                "output": json.dumps(payload, ensure_ascii=False),
+                "exit_code": 0,
+                "discovered_tools": list(discovered),
+            }
     elif tool == "manage_tasks":
         desc = "manage_tasks"
         result = await do_manage_tasks(content, owner=owner)

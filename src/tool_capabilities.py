@@ -74,6 +74,10 @@ _register(
     ToolEffect.USER_INTERACTION,
 )
 _register(
+    {"discover_tools"},
+    ToolEffect.READ_PRIVATE,
+)
+_register(
     {
         "list_cached_models",
         "list_cookbook_servers",

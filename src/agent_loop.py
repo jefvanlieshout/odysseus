@@ -69,6 +69,48 @@ from src.agent_tools import (
 
 logger = logging.getLogger(__name__)
 
+# v0.2.4 controller-owned recovery schema.
+_DISCOVER_TOOLS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "discover_tools",
+        "description": (
+            "Recover a tool/capability that is not currently visible. "
+            "Describe what capability you need in natural language. "
+            "This only searches controller-permitted installed/connected tools; "
+            "it does NOT execute, enable, connect, or grant permission. "
+            "Use it only when the needed concrete tool is not already available."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Capability needed, e.g. 'read Proxmox guest status', "
+                        "'cancel a reminder', or 'search connected email'."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 12,
+                    "description": "Maximum matching tools to recover (default 8).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+if not any(
+    (schema.get("function") or {}).get("name") == "discover_tools"
+    for schema in FUNCTION_TOOL_SCHEMAS
+):
+    FUNCTION_TOOL_SCHEMAS.append(_DISCOVER_TOOLS_SCHEMA)
+TOOL_TAGS.add("discover_tools")
+
+
 _BROWSER_MCP_PREFIX = "mcp__builtin_browser__"
 
 
@@ -312,6 +354,7 @@ The block executes automatically and you see the output."""
 _AGENT_RULES = """\
 ## Rules
 - Only use tools when needed. Don't search for things you already know.
+- If the task needs a capability but no suitable concrete tool is currently available, call `discover_tools` once with a short description of what you need. Use only tools it returns; discovery never grants permission.
 - For web lookup/search/latest/current requests, use `web_search` or `web_fetch`. Do NOT use `bash`, `python`, `curl`, `requests`, or scraping code for web lookup unless web tools are disabled or already failed.
 - If `web_search` is listed in this prompt, web search is available. Do NOT tell the user search/web tools are unavailable.
 - These exact tags execute automatically. For showing code examples, use ```shell, ```sh, ```py, etc. instead.
@@ -4141,6 +4184,43 @@ async def stream_agent_loop(
     _base_relevant_tools = None if _relevant_tools is None else set(_relevant_tools)
     _runtime_skill_tools: Set[str] = set()
 
+    # v0.2.4 shared discovery visibility unlock
+    # discover_tools can execute either in the ordinary tool loop or through
+    # exact-approval replay. Both paths must apply the same controller-owned
+    # visibility mutation, otherwise an approved discovery succeeds but its
+    # recovered tools never reach the next model round.
+    def _unlock_discovered_tools(result: Dict, *, source: str) -> list[str]:
+        if (
+            _relevant_tools is None
+            or not isinstance(result, dict)
+            or result.get("error")
+        ):
+            return []
+
+        raw_discovered = result.get("discovered_tools") or []
+        new_discovered = {
+            str(name)
+            for name in raw_discovered
+            if name
+            and str(name) != "discover_tools"
+            and str(name) not in disabled_tools
+            and str(name) not in _relevant_tools
+        }
+
+        if new_discovered:
+            _relevant_tools.update(new_discovered)
+            if _base_relevant_tools is not None:
+                _base_relevant_tools.update(new_discovered)
+            logger.info(
+                "[tool-broker] discover_tools unlocked for next round "
+                "source=%s tools=%s",
+                source,
+                sorted(new_discovered),
+            )
+
+        result["newly_visible_tools"] = sorted(new_discovered)
+        return sorted(new_discovered)
+
     def _route_finetune_modes(candidate_model: str):
         is_ody = _is_odysseus_qwen_model(candidate_model)
         doc_mode = (
@@ -4678,6 +4758,12 @@ async def stream_agent_loop(
                 except (asyncio.CancelledError, Exception):
                     pass
         total_tool_calls += 1
+
+        if approved.tool_name == "discover_tools":
+            _unlock_discovered_tools(
+                approved_result,
+                source="approved-replay",
+            )
 
         if tool_result_is_successful(approved_result):
             for doc_event in _document_stream_events(approved_block):
@@ -5912,6 +5998,14 @@ async def stream_agent_loop(
                             pass
 
             run_security.observe_tool_result(block.tool_type, result, block.content)
+
+
+            # v0.2.4 real discover_tools recovery.
+            if block.tool_type == "discover_tools":
+                _unlock_discovered_tools(
+                    result,
+                    source=f"round-{round_num}",
+                )
 
             # A skill the model just loaded can prescribe tools that weren't
             # RAG-selected this turn (declared via requires_toolsets in its

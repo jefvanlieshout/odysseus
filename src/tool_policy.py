@@ -51,6 +51,7 @@ def web_search_enabled_for_turn(allow_web_search: object, use_web: object = None
 
 
 _COMMON_TOOL_NAMES = {
+    "discover_tools",
     "api_call",
     "app_api",
     "archive_email",

@@ -165,7 +165,8 @@ def main() -> None:
         current=wide_current,
         messages=[],
     )
-    assert preview_wide.tools == wide_current
+    # v0.2.4 keeps discover_tools core-visible so recovery is always possible.
+    assert preview_wide.tools == (wide_current | {"discover_tools"})
     assert not preview_wide.removed
 
     preview_disabled = preview_final_tool_visibility(
@@ -180,10 +181,11 @@ def main() -> None:
         current={"ask_user", "manage_memory", "update_plan"},
         messages=[],
         forced_names={"web_search"},
-        max_visible=4,
+        # v0.2.4 adds discover_tools as a fifth core/recovery candidate.
+        max_visible=5,
     )
     assert preview_forced.tools == {
-        "ask_user", "manage_memory", "update_plan", "web_search",
+        "ask_user", "discover_tools", "manage_memory", "update_plan", "web_search",
     }
 
     # Typed cold-start recovery: a controller-classified reminder domain must
@@ -224,6 +226,84 @@ def main() -> None:
     )
     assert adapted == {"ask_user", "manage_notes"}
     assert "manage_calendar" not in adapted
+
+
+    # v0.2.4 discovery fallback is deterministic.
+    from assistant.fork.tool_broker_runtime import _discovery_name_score
+
+    assert _discovery_name_score(
+        "mcp__assistant_reminders__assistant_create_reminder",
+        "create a reminder",
+    ) > 0
+    assert _discovery_name_score(
+        "proxmox_get_guest_status",
+        "read proxmox guest status",
+    ) >= 2
+    assert _discovery_name_score("send_email", "proxmox guest status") == 0
+
+
+    # v0.2.4 discovery precision: purpose-built tools outrank generic escape
+    # hatches even if semantic retrieval originally placed the generic tools first.
+    from assistant.fork.tool_broker_runtime import _rank_discovery_candidates
+
+    ranked_models = _rank_discovery_candidates(
+        "inspect locally served AI models and running model server status",
+        [
+            "app_api",
+            "manage_memory",
+            "bash",
+            "list_cached_models",
+            "stop_served_model",
+            "list_served_models",
+            "ask_user",
+        ],
+        descriptions={
+            "list_served_models": "List running model servers and their status.",
+            "list_cached_models": "List cached AI models.",
+            "stop_served_model": "Stop a running model server.",
+            "bash": "Run shell commands on the server.",
+            "app_api": "Generic internal API loopback.",
+            "ask_user": "Ask the user a question.",
+            "manage_memory": "Manage persistent user memories.",
+        },
+    )
+    assert ranked_models[0] == "list_served_models"
+    assert ranked_models.index("list_cached_models") < ranked_models.index("bash")
+    assert ranked_models.index("stop_served_model") < ranked_models.index("ask_user")
+
+    ranked_reminders = _rank_discovery_candidates(
+        "create cancel and list reminders",
+        [
+            "ask_user",
+            "mcp__assistant_reminders__assistant_cancel_reminder",
+            "manage_memory",
+            "mcp__assistant_reminders__assistant_list_reminders",
+            "mcp__assistant_reminders__assistant_create_reminder",
+        ],
+        descriptions={},
+    )
+    assert ranked_reminders[:3] == (
+        "mcp__assistant_reminders__assistant_cancel_reminder",
+        "mcp__assistant_reminders__assistant_list_reminders",
+        "mcp__assistant_reminders__assistant_create_reminder",
+    )
+
+    ranked_email = _rank_discovery_candidates(
+        "read search and list email",
+        [
+            "app_api",
+            "read_email",
+            "manage_mcp",
+            "list_emails",
+            "search_emails",
+        ],
+        descriptions={},
+    )
+    assert set(ranked_email[:3]) == {
+        "read_email",
+        "list_emails",
+        "search_emails",
+    }
 
     # Agent identity is provenance only; child delegation is explicit.
     ctx = ExecutionContext(agent_id="main", source="telegram", user_id="user-1", session_id="s1")
