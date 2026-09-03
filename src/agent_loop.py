@@ -1454,7 +1454,9 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     def has(*patterns: str) -> bool:
         return any(re.search(p, q) for p in patterns)
 
-    if has(r"\b(cookbook|serve|serving|served|launch|start|preset|vllm|sglang|llama\.?cpp|ollama|download|downloading|pull|cached models?|running models?|model servers?|models? (?:are )?running|what models?|model picker|gpu box|workstation|server|qwen|gemma|llama|mistral|minimax)\b"):
+    # Generic infrastructure words are weak evidence; domain signals no longer
+    # need to guess "server" == Cookbook.
+    if has(r"\b(cookbook|serve|serving|served|launch|start|preset|vllm|sglang|llama\.?cpp|ollama|download|downloading|pull|cached models?|running models?|model servers?|models? (?:are )?running|what models?|model picker|gpu box|workstation|qwen|gemma|llama|mistral|minimax)\b"):
         domains.add("cookbook")
     if has(r"\b(emails?|mails?|gmail|inbox|reply|forward|cc|bcc|send email|compose email|draft email|message chris|message him|message her)\b"):
         domains.add("email")
@@ -1473,7 +1475,9 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("documents")
     if "notes_calendar_tasks" not in domains and has(r"\bwrite\b"):
         domains.add("documents")
-    if has(r"\b(search|web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b"):
+    # "latest/current" can describe local email/model/calendar state; explicit
+    # web/search language remains the deterministic web hint.
+    if has(r"\b(search|web|google|look up|news|weather|forecast|stock price|price of|website|url|https?://|www\.)\b"):
         domains.add("web")
     if has(
         r"\b(wyszukaj|wyszukać|wyszukac)\b.*\b(internet|internecie|online|web)\b",
@@ -1483,7 +1487,13 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("web")
     if has(r"\b(research|deep dive|investigate|look into)\b"):
         domains.add("web")
-    if has(r"\b(open|show|toggle|turn on|turn off|disable|enable|switch model|change model|settings|theme|panel)\b"):
+    if has(
+        r"\b(browser|browse|navigate|click|scroll|fill form|web page)\b",
+        r"\b(open|visit|go to)\b.{0,24}\b(site|website|page)\b",
+    ):
+        domains.add("browser")
+    # "show me ..." is ordinary read intent, not automatically a UI action.
+    if has(r"\b(open|toggle|turn on|turn off|disable|enable|switch model|change model|settings|theme|panel)\b"):
         domains.add("ui")
     if has(r"\b(session|chat history|rename chat|delete chat|archive chat|fork chat|list chats)\b"):
         domains.add("sessions")
@@ -3991,35 +4001,19 @@ async def stream_agent_loop(
                 _relevant_tools.update(tools)
         logger.info(f"[tool-rag] Keyword fallback selected: {sorted(_relevant_tools - ALWAYS_AVAILABLE)}")
 
-    # If deterministic domain detection fired, seed the corresponding domain
-    # tools into the selected tool set. This is not direct prompt-pack
-    # injection: `_assemble_prompt()` still derives domain rules from the final
-    # tool names. It prevents obvious requests like "last 5 emails" from
-    # collapsing to only ask_user/manage_memory when vector retrieval misses or
-    # times out.
+    # v0.2.5 ToolCatalog selector boundary.
+    # Only hard document/file/workspace context mutates the pre-Broker candidate
+    # set. Generic web/UI/settings/browser/domain relevance is now a typed signal
+    # consumed by ToolSelector + ToolBroker instead of direct concrete seeding.
     if not guide_only and _relevant_tools is not None:
-        for _domain in (_intent.get("domains") or set()):
-            _relevant_tools.update(_DOMAIN_TOOL_MAP.get(str(_domain), set()))
-        if "cookbook" in (_intent.get("domains") or set()):
-            _relevant_tools.update({
-                "list_served_models",
-                "list_downloads",
-                "list_cached_models",
-                "list_cookbook_servers",
-                "list_serve_presets",
-            })
-        if "email" in (_intent.get("domains") or set()):
-            _relevant_tools.add("ui_control")
-        if "web" in (_intent.get("domains") or set()):
-            _relevant_tools.update(WEB_TOOL_NAMES)
-            _blocked_web_tools = sorted(WEB_TOOL_NAMES & disabled_tools)
-            if _blocked_web_tools:
-                logger.info(
-                    "[agent-intent] web domain selected but search tools remain disabled=%s",
-                    _blocked_web_tools,
-                )
-        if "ui" in (_intent.get("domains") or set()):
-            _relevant_tools.add("ui_control")
+        _intent_domain_names = {
+            str(domain)
+            for domain in (_intent.get("domains") or set())
+        }
+
+        for _domain in sorted(_intent_domain_names & {"documents", "files"}):
+            _relevant_tools.update(_DOMAIN_TOOL_MAP.get(_domain, set()))
+
         if (
             (
                 (
@@ -4031,8 +4025,11 @@ async def stream_agent_loop(
             and not _active_document_relevant
             and not active_email
             and not (
-                set(_intent.get("domains") or set())
-                & {"notes_calendar_tasks", "email", "contacts", "sessions", "integrations", "ui"}
+                _intent_domain_names
+                & {
+                    "notes_calendar_tasks", "email", "contacts",
+                    "sessions", "integrations", "settings", "ui",
+                }
             )
         ):
             _relevant_tools = set(_WORKSPACE_TERMINUS_TOOLS)
@@ -4067,43 +4064,15 @@ async def stream_agent_loop(
             _relevant_tools = set(ALWAYS_AVAILABLE)
         _relevant_tools.update({"read_file", "grep", "ls", "manage_documents"})
 
-    # Per-request forced tools are stronger than retrieval. Explicit search
-    # settings make web tools visible even when tool RAG misses them;
-    # route-level disabled_tools decides what remains allowed.
-    if not guide_only and forced_tools:
-        forced_set = {t for t in forced_tools if t not in disabled_tools}
-        if _relevant_tools is None:
-            from src.tool_index import ALWAYS_AVAILABLE
-            _relevant_tools = set(ALWAYS_AVAILABLE)
-        _relevant_tools.update(forced_set)
 
-    if not guide_only and _relevant_tools is not None:
-        _relevant_tools = _expand_browser_mcp_tools(_relevant_tools, mcp_mgr)
+    # v0.2.5 browser MCP tools are ordinary catalog candidates. A stray
+    # semantic browser hit must not expand the entire Playwright server.
 
-    # Assistant fork: real tool executions keep a capability visible briefly
-    # for natural follow-ups (for example, calendar -> "move the first one").
-    # This is visibility only; Odysseus authorization/approval remains authority.
-    if not guide_only:
-        try:
-            from assistant.fork.tool_broker_runtime import apply_sticky_tool_visibility
-            _sticky_visibility = apply_sticky_tool_visibility(
-                current=_relevant_tools,
-                messages=messages,
-                disabled_tools=disabled_tools,
-                mcp_mgr=mcp_mgr,
-            )
-            _relevant_tools = _sticky_visibility.tools
-            if _sticky_visibility.added:
-                logger.info(
-                    "[tool-broker] sticky tools=%s evidence=%s",
-                    list(_sticky_visibility.added),
-                    list(_sticky_visibility.evidence),
-                )
-        except Exception as _e:
-            logger.warning(
-                "[tool-broker] sticky visibility failed; keeping selector output: %s",
-                _e,
-            )
+    # v0.2.5 Broker owns forced/sticky composition.
+    # forced_tools are passed as explicit Broker hints; verified tool history
+    # is consumed by preview_final_tool_visibility. Neither path mutates the
+    # pre-Broker candidate set independently anymore.
+
 
     # The skill index injected by _build_system_prompt tells the model to
     # call `manage_skills action=view`, and Jaccard-matched skills are pasted
@@ -4143,10 +4112,10 @@ async def stream_agent_loop(
         except Exception as _e:
             logger.debug(f"[tool-rag] skill-aware tool include skipped: {_e}")
 
-    # v0.2.3 broker shadow visibility
-    # The old selector still drives live behavior for now. ToolBroker computes
-    # the set it would expose after RAG/keywords/domains/skills/sticky state,
-    # and we log differences before making it authoritative.
+    # v0.2.5 Broker final visibility.
+    # Retrieval, typed intent, explicit context, skills, runtime MCP state and
+    # verified history contribute candidates/signals; ToolBroker owns the final
+    # visible set. Model adapters below may only remove unsupported tools.
     if not guide_only and _relevant_tools is not None:
         try:
             from assistant.fork.tool_broker_runtime import preview_final_tool_visibility
@@ -4161,6 +4130,7 @@ async def stream_agent_loop(
                 mcp_mgr=mcp_mgr,
                 forced_names=forced_tools or set(),
                 suggested_capabilities=_broker_suggested_capabilities,
+                domain_members=_DOMAIN_TOOL_MAP,
             )
             logger.info(
                 "[tool-broker] final current=%s selected=%s added=%s removed=%s "
@@ -4176,7 +4146,7 @@ async def stream_agent_loop(
             _relevant_tools = set(_broker_preview.tools)
         except Exception as _e:
             logger.warning(
-                "[tool-broker] shadow visibility failed; live selector unchanged: %s",
+                "[tool-broker] final visibility failed; preserving pre-Broker candidates: %s",
                 _e,
             )
 
@@ -4649,17 +4619,22 @@ async def stream_agent_loop(
         if _force_answer:
             return []
         if route_state["is_api_model"]:
-            if route_relevant_tools:
+            # v0.2.5 final schema authority:
+            #   None  -> no selector boundary supplied (legacy fallback)
+            #   set() -> selector deliberately exposed no tools
+            #
+            # Admin status is authorization context, not relevance. Do NOT
+            # union _ADMIN_TOOLS here: ToolBroker must explicitly expose an
+            # admin tool before the model receives its schema.
+            if route_relevant_tools is not None:
                 schema_names = set(route_relevant_tools)
-                if _needs_admin:
-                    schema_names |= _ADMIN_TOOLS
                 base_schemas = [
                     schema for schema in FUNCTION_TOOL_SCHEMAS
                     if schema.get("function", {}).get("name") in schema_names
                 ]
                 mcp_filtered = [
                     schema for schema in route_mcp_schemas
-                    if schema.get("function", {}).get("name") in route_relevant_tools
+                    if schema.get("function", {}).get("name") in schema_names
                 ]
                 schemas = base_schemas + mcp_filtered
             else:

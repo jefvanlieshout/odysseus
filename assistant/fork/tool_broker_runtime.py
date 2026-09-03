@@ -15,35 +15,15 @@ import re
 from typing import Any, Iterable, Mapping, Sequence
 
 
-_BUILTIN_FAMILIES: Mapping[str, frozenset[str]] = {
-    "calendar": frozenset({"manage_calendar"}),
-    "notes_tasks": frozenset({"manage_notes", "manage_tasks"}),
-    "email": frozenset({
-        "list_email_accounts", "list_emails", "read_email",
-        "scan_email_unsubscribes", "unsubscribe_email", "send_email",
-        "reply_to_email", "bulk_email", "archive_email", "delete_email",
-        "mark_email_read", "resolve_contact", "ui_control",
-    }),
-    "contacts": frozenset({"resolve_contact", "manage_contact"}),
-    "sessions": frozenset({
-        "create_session", "list_sessions", "manage_session",
-        "send_to_session", "search_chats",
-    }),
-    "integrations": frozenset({"api_call"}),
-    "research": frozenset({"trigger_research", "manage_research"}),
-    "cookbook": frozenset({
-        "download_model", "serve_model", "serve_preset", "list_serve_presets",
-        "list_served_models", "stop_served_model", "tail_serve_output",
-        "list_downloads", "cancel_download", "search_hf_models",
-        "list_cached_models", "list_cookbook_servers", "adopt_served_model",
-    }),
-}
-
-_TOOL_TO_FAMILY = {
-    tool: family
-    for family, tools in _BUILTIN_FAMILIES.items()
-    for tool in tools
-}
+from assistant.fork.tool_catalog import (
+    build_runtime_registry,
+    build_tool_catalog,
+    capabilities_for_name as _catalog_capabilities_for_name,
+    connected_mcp_names as _catalog_connected_mcp_names,
+    domain_capabilities as _catalog_domain_capabilities,
+    record_for_runtime_name,
+)
+from assistant.fork.tool_selector import build_candidate_plan
 
 _MCP_QUALIFIED_RE = re.compile(r"\bmcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+\b")
 
@@ -129,21 +109,7 @@ def _mcp_server_prefix(name: str) -> str | None:
 
 
 def _connected_mcp_names(mcp_mgr: Any) -> set[str]:
-    names: set[str] = set()
-    if mcp_mgr is None:
-        return names
-    try:
-        for tool in mcp_mgr.get_all_tools():
-            if not isinstance(tool, Mapping) or tool.get("is_disabled"):
-                continue
-            qualified = str(tool.get("qualified_name") or "").strip()
-            if qualified:
-                names.add(qualified)
-    except Exception:
-        # Visibility enrichment is optional. Failure here must never break the
-        # agent loop or weaken the controller's existing permission checks.
-        return set()
-    return names
+    return set(_catalog_connected_mcp_names(mcp_mgr))
 
 
 def sticky_tools_from_history(
@@ -151,8 +117,14 @@ def sticky_tools_from_history(
     *,
     mcp_mgr: Any = None,
     previous_user_turns: int = 2,
+    suggested_capabilities: Iterable[str] = (),
+    domain_members: Mapping[str, Iterable[str]] | None = None,
 ) -> tuple[set[str], tuple[str, ...]]:
-    """Expand recent authoritative tool use into follow-up visibility."""
+    """Return the tools held by short verified capability leases.
+
+    Compatibility helper for existing tests/callers. Live selection uses the
+    same provider plan inside ``preview_final_tool_visibility``.
+    """
     evidence = recent_authoritative_tool_names(
         messages,
         previous_user_turns=previous_user_turns,
@@ -160,27 +132,35 @@ def sticky_tools_from_history(
     if not evidence:
         return set(), ()
 
-    sticky: set[str] = set()
-    connected_mcp = _connected_mcp_names(mcp_mgr)
-
+    records = build_tool_catalog(
+        mcp_mgr=mcp_mgr,
+        domain_members=domain_members,
+    )
     for name in evidence:
-        family = _TOOL_TO_FAMILY.get(name)
-        if family:
-            sticky.update(_BUILTIN_FAMILIES[family])
-            continue
+        if name not in records:
+            records[name] = record_for_runtime_name(
+                name,
+                domain_members=domain_members,
+            )
 
-        prefix = _mcp_server_prefix(name)
-        if prefix:
-            # One real call on an MCP server keeps sibling tools visible for
-            # natural follow-ups such as ``cancel it`` after create_reminder.
-            siblings = {tool for tool in connected_mcp if tool.startswith(prefix)}
-            sticky.update(siblings or {name})
-            continue
-
-        # Unknown/custom tools are sticky only as themselves. Do not invent a
-        # capability relation we cannot prove.
-        sticky.add(name)
-
+    plan = build_candidate_plan(
+        records=records,
+        current_names=(),
+        forced_names=(),
+        core_names=(),
+        suggested_capabilities=suggested_capabilities,
+        evidence_names=evidence,
+        max_visible=64,
+    )
+    sticky = {
+        candidate.name
+        for candidate in plan.candidates
+        if candidate.reason in {
+            "verified-capability-lease",
+            "verified-tool-lease",
+            "lease-domain-anchor",
+        }
+    }
     return sticky, evidence
 
 
@@ -227,59 +207,31 @@ def apply_sticky_tool_visibility(
 # v0.2.3 broker shadow visibility
 @dataclass(frozen=True, slots=True)
 class BrokerVisibilityPreview:
-    """Behavior-free preview of the ToolBroker's proposed final visible set."""
+    """Final ToolBroker visibility plus explainability metadata."""
 
     tools: set[str]
     added: tuple[str, ...]
     removed: tuple[str, ...]
     evidence: tuple[str, ...]
     reasons: Mapping[str, str]
+    budget: int | None = None
 
 
 # v0.2.3 typed cold-start capability recovery
-def _broker_capabilities_for_name(name: str) -> frozenset[str]:
-    """Return conservative typed capabilities for one concrete tool.
-
-    These capabilities classify tools, not user prose. They let the
-    controller's already-typed intent recover a permitted tool when semantic
-    retrieval misses it, without reintroducing keyword routing in the Broker.
-    """
-    caps = {f"tool:{name}"}
-
-    family = _TOOL_TO_FAMILY.get(name)
-    if family:
-        caps.add(f"family:{family}")
-
-    prefix = _mcp_server_prefix(name)
-    if prefix:
-        caps.add(f"mcp-server:{prefix}")
-
-    if "reminder" in name.lower():
-        caps.add("family:reminders")
-
-    return frozenset(caps)
-
-
-_BROKER_DOMAIN_CAPABILITIES: Mapping[str, frozenset[str]] = {
-    "notes_calendar_tasks": frozenset({
-        "family:calendar",
-        "family:notes_tasks",
-        "family:reminders",
-    }),
-    "email": frozenset({"family:email"}),
-    "contacts": frozenset({"family:contacts"}),
-    "cookbook": frozenset({"family:cookbook"}),
-    "sessions": frozenset({"family:sessions"}),
-    "integrations": frozenset({"family:integrations"}),
-}
+def _broker_capabilities_for_name(
+    name: str,
+    *,
+    domain_members: Mapping[str, Iterable[str]] | None = None,
+) -> frozenset[str]:
+    return _catalog_capabilities_for_name(
+        name,
+        domain_members=domain_members,
+    )
 
 
 def broker_capabilities_for_domains(domains: Iterable[str]) -> tuple[str, ...]:
-    """Translate controller/router domains into typed Broker suggestions."""
-    caps: set[str] = set()
-    for domain in domains:
-        caps.update(_BROKER_DOMAIN_CAPABILITIES.get(str(domain), ()))
-    return tuple(sorted(caps))
+    """Translate typed controller domains into ToolCatalog capabilities."""
+    return _catalog_domain_capabilities(domains)
 
 
 def preview_final_tool_visibility(
@@ -291,98 +243,92 @@ def preview_final_tool_visibility(
     forced_names: Iterable[str] = (),
     suggested_capabilities: Iterable[str] = (),
     max_visible: int | None = None,
+    domain_members: Mapping[str, Iterable[str]] | None = None,
 ) -> BrokerVisibilityPreview:
-    """Compute the v0.2.3 Broker proposal without changing live visibility."""
+    """Select final visibility from independent candidate providers.
 
-    from assistant.fork.tool_broker import (
-        ConversationToolState,
-        ToolBroker,
-        ToolDescriptor,
-    )
+    Odysseus supplies tool facts and initial retrieval/context candidates.
+    ToolCatalog normalizes the installed/connected universe. Candidate providers
+    emit relevance signals. ToolBroker alone enforces the final visibility set
+    inside that controller-owned permitted universe.
+    """
+    from assistant.fork.tool_broker import ToolBroker, ToolDescriptor
     from src.tool_index import ALWAYS_AVAILABLE
-    from src.tool_policy import known_tool_names
 
     disabled = {str(name) for name in disabled_tools if name}
-    connected_mcp = _connected_mcp_names(mcp_mgr)
+    current_set = {
+        str(name)
+        for name in (current or ())
+        if name and str(name) not in disabled
+    }
+    forced = {
+        str(name)
+        for name in forced_names
+        if name and str(name) not in disabled
+    }
+    evidence = recent_authoritative_tool_names(messages)
 
-    permitted = set(known_tool_names())
-    permitted.update(connected_mcp)
-    permitted.difference_update(disabled)
+    records = build_tool_catalog(
+        mcp_mgr=mcp_mgr,
+        disabled_tools=disabled,
+        domain_members=domain_members,
+    )
 
-    current_set = set(current or ())
-    permitted.update(name for name in current_set if name not in disabled)
+    # Caller-provided/custom runtime tools must remain selectable even when an
+    # older Odysseus metadata surface has not learned about them yet. They get
+    # conservative metadata; execution/security still decide authority.
+    required_runtime_names = (
+        current_set
+        | forced
+        | set(evidence)
+        | set(ALWAYS_AVAILABLE)
+        | {"discover_tools"}
+    )
+    for name in required_runtime_names:
+        if name and name not in disabled and name not in records:
+            records[name] = record_for_runtime_name(
+                name,
+                domain_members=domain_members,
+            )
 
-    forced = {str(name) for name in forced_names if name}
-    permitted.update(name for name in forced if name not in disabled)
-
+    permitted = set(records)
     if not permitted:
         return BrokerVisibilityPreview(
             tools=set(),
             added=(),
             removed=tuple(sorted(current_set)),
-            evidence=(),
+            evidence=evidence,
             reasons={},
         )
 
     descriptors = [
         ToolDescriptor(
-            name=name,
-            capabilities=_broker_capabilities_for_name(name),
-            core_visible=(name in ALWAYS_AVAILABLE or name == "discover_tools"),
-            source="mcp" if name.startswith("mcp__") else "builtin",
+            name=record.name,
+            capabilities=record.capabilities,
+            core_visible=(
+                record.name in ALWAYS_AVAILABLE
+                or record.name == "discover_tools"
+            ),
+            source=record.source,
+            description=record.description,
         )
-        for name in sorted(permitted)
+        for record in records.values()
     ]
 
-    state = ConversationToolState()
-    evidence = recent_authoritative_tool_names(messages)
-    for name in evidence:
-        state.activate(*_broker_capabilities_for_name(name))
-
-    suggested = {str(cap) for cap in suggested_capabilities if cap}
-
-    semantic_scores = {
-        name: 1.0
-        for name in current_set
-        if name in permitted
-    }
-
-    # v0.2.3 preserve-candidates shadow tuning
-    # The first production finalizer must not silently drop legacy-selected
-    # candidates merely to hit an arbitrary prompt-size target. Preserve every
-    # current candidate plus core/forced/authoritative-sticky recovery tools.
-    # Prompt-budget ranking can become a separate, measured migration later.
-    sticky_preview, _ = sticky_tools_from_history(messages, mcp_mgr=mcp_mgr)
-    sticky_preview.difference_update(disabled)
-
-    suggested_names = {
-        descriptor.name
-        for descriptor in descriptors
-        if descriptor.capabilities & suggested
-    }
-
-    candidate_names = (
-        current_set
-        | forced
-        | set(ALWAYS_AVAILABLE)
-        | {"discover_tools"}
-        | sticky_preview
-        | suggested_names
-    )
-    candidate_names.intersection_update(permitted)
-    selection_limit = (
-        int(max_visible)
-        if max_visible is not None
-        else max(1, len(candidate_names))
+    plan = build_candidate_plan(
+        records=records,
+        current_names=current_set,
+        forced_names=forced,
+        core_names=set(ALWAYS_AVAILABLE) | {"discover_tools"},
+        suggested_capabilities=suggested_capabilities,
+        evidence_names=evidence,
+        max_visible=max_visible,
     )
 
-    broker = ToolBroker(descriptors, max_visible=selection_limit)
-    selection = broker.select(
+    broker = ToolBroker(descriptors, max_visible=plan.budget)
+    selection = broker.select_candidates(
         permitted_names=permitted,
-        state=state,
-        suggested_capabilities=tuple(sorted(suggested)),
-        semantic_scores=semantic_scores,
-        forced_names=tuple(sorted(forced)),
+        candidates=plan.candidates,
     )
     proposed = set(selection.visible)
 
@@ -393,6 +339,7 @@ def preview_final_tool_visibility(
         evidence=evidence,
         reasons=dict(selection.reasons),
     )
+
 
 # v0.2.3 model-adapter visibility restriction
 def restrict_tool_visibility(
@@ -467,34 +414,17 @@ def _discovery_name_score(name: str, query: str) -> int:
     return len(query_tokens & name_tokens)
 
 
-def _discovery_description_map() -> dict[str, str]:
-    descriptions: dict[str, str] = {}
-    try:
-        from src.tool_index import BUILTIN_TOOL_DESCRIPTIONS
-        descriptions.update({
-            str(name): str(description or "")
-            for name, description in BUILTIN_TOOL_DESCRIPTIONS.items()
-        })
-    except Exception:
-        pass
-
-    # Native schemas sometimes carry newer/more precise wording than the ToolIndex
-    # registry. Merge them so discovery ranking follows the actual callable surface.
-    try:
-        from src.tool_schemas import FUNCTION_TOOL_SCHEMAS
-        for schema in FUNCTION_TOOL_SCHEMAS:
-            fn = schema.get("function") if isinstance(schema, dict) else None
-            if not isinstance(fn, dict):
-                continue
-            name = str(fn.get("name") or "").strip()
-            description = str(fn.get("description") or "").strip()
-            if name and description:
-                descriptions[name] = (
-                    descriptions.get(name, "") + " " + description
-                ).strip()
-    except Exception:
-        pass
-    return descriptions
+def _discovery_description_map(
+    *,
+    mcp_mgr: Any = None,
+) -> dict[str, str]:
+    """Use the normalized ToolCatalog descriptions for discovery precision."""
+    records = build_tool_catalog(mcp_mgr=mcp_mgr)
+    return {
+        name: record.description
+        for name, record in records.items()
+        if record.description
+    }
 
 
 def _rank_discovery_candidates(
@@ -589,13 +519,13 @@ def discover_runtime_tools(
     except (TypeError, ValueError):
         max_results = 8
 
-    from src.tool_policy import known_tool_names
-
     disabled = {str(name) for name in disabled_tools if name}
-    permitted = set(known_tool_names())
-    permitted.update(_connected_mcp_names(mcp_mgr))
+    runtime_registry = build_runtime_registry(
+        mcp_mgr=mcp_mgr,
+        disabled_tools=disabled,
+    )
+    permitted = set(runtime_registry)
     permitted.discard("discover_tools")
-    permitted.difference_update(disabled)
 
     if not permitted:
         return ()
@@ -655,7 +585,7 @@ def discover_runtime_tools(
     ranked = _rank_discovery_candidates(
         query,
         semantic_candidates,
-        descriptions=_discovery_description_map(),
+        descriptions=_discovery_description_map(mcp_mgr=mcp_mgr),
     )
 
     # A semantic outage can leave the pool empty. Preserve the old deterministic

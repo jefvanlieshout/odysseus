@@ -29,6 +29,16 @@ class _FakeMcpManager:
             {"qualified_name": "mcp__assistant_reminders__assistant_create_reminder"},
             {"qualified_name": "mcp__assistant_reminders__assistant_list_reminders"},
             {"qualified_name": "mcp__assistant_reminders__assistant_cancel_reminder"},
+            {"qualified_name": "mcp__email__list_emails"},
+            {"qualified_name": "mcp__email__read_email"},
+            {"qualified_name": "mcp__builtin_browser__browser_wait_for"},
+            {"qualified_name": "mcp__builtin_browser__browser_navigate"},
+            {"qualified_name": "mcp__builtin_browser__browser_snapshot"},
+            {"qualified_name": "mcp__builtin_browser__browser_click"},
+            {"qualified_name": "mcp__builtin_browser__browser_fill_form"},
+            {"qualified_name": "mcp__builtin_browser__browser_type"},
+            {"qualified_name": "mcp__builtin_browser__browser_press_key"},
+            {"qualified_name": "mcp__builtin_browser__browser_tabs"},
             {"qualified_name": "mcp__other__unrelated"},
         ]
 
@@ -154,9 +164,9 @@ def main() -> None:
     assert "mcp__assistant_reminders__assistant_cancel_reminder" in preview.tools
     assert "mcp__other__unrelated" not in preview.tools
 
-    # Shadow-mode safety regression: until we have real ranking scores,
-    # an arbitrarily wide legacy candidate set must be preserved intact rather
-    # than alphabetically truncated at 24 tools.
+    # v0.2.5 deliberate prompt budget: an arbitrarily wide legacy candidate
+    # set is trimmed instead of blindly preserving every schema. Core recovery
+    # remains visible and omitted tools are recoverable through discover_tools.
     wide_current = {
         "ask_user", "manage_memory", "update_plan",
         *(f"shadow_custom_{idx}" for idx in range(30)),
@@ -165,9 +175,11 @@ def main() -> None:
         current=wide_current,
         messages=[],
     )
-    # v0.2.4 keeps discover_tools core-visible so recovery is always possible.
-    assert preview_wide.tools == (wide_current | {"discover_tools"})
-    assert not preview_wide.removed
+    assert {
+        "ask_user", "discover_tools", "manage_memory", "update_plan",
+    } <= preview_wide.tools
+    assert len(preview_wide.tools) <= 24
+    assert preview_wide.removed
 
     preview_disabled = preview_final_tool_visibility(
         current={"ask_user", "manage_calendar"},
@@ -227,6 +239,174 @@ def main() -> None:
     assert adapted == {"ask_user", "manage_notes"}
     assert "manage_calendar" not in adapted
 
+
+    # v0.2.5 ToolCatalog architecture: Odysseus owns tool facts; the fork
+    # adapts them and owns only orchestration hints/candidate ranking.
+    from assistant.fork.tool_catalog import (
+        anchor_names_for_capabilities,
+        audit_tool_catalog,
+        build_tool_catalog,
+    )
+    from assistant.fork.tool_selector import build_candidate_plan
+
+    _test_domain_members = {
+        "web": {"web_search", "web_fetch"},
+        "email": {
+            "list_email_accounts", "list_emails", "read_email",
+            "resolve_contact", "manage_contact",
+        },
+        "contacts": {"resolve_contact", "manage_contact"},
+        "cookbook": {
+            "list_served_models", "list_cached_models",
+            "tail_serve_output", "serve_model",
+        },
+        "notes_calendar_tasks": {
+            "manage_notes", "manage_calendar", "manage_tasks",
+        },
+        "ui": {"ui_control"},
+        "sessions": {
+            "list_sessions", "manage_session", "search_chats",
+        },
+        "settings": {
+            "manage_settings", "manage_mcp", "manage_endpoints",
+        },
+        "integrations": {"api_call"},
+    }
+
+    catalog_audit = audit_tool_catalog(
+        domain_members=_test_domain_members,
+    )
+    assert catalog_audit.ok, catalog_audit.errors
+
+    catalog = build_tool_catalog(
+        mcp_mgr=_FakeMcpManager(),
+        domain_members=_test_domain_members,
+    )
+    assert "tail_serve_output" in catalog
+    assert {
+        "domain:email",
+        "domain:contacts",
+    } <= catalog["resolve_contact"].capabilities
+    assert "domain:email" in catalog["mcp__email__list_emails"].capabilities
+    assert "domain:browser" in catalog[
+        "mcp__builtin_browser__browser_wait_for"
+    ].capabilities
+    assert "family:reminders" in catalog[
+        "mcp__assistant_reminders__assistant_create_reminder"
+    ].capabilities
+
+    email_anchors = set(anchor_names_for_capabilities(
+        {"domain:email"},
+        catalog,
+    ))
+    assert {"list_emails", "read_email", "resolve_contact"} <= email_anchors
+    assert "mcp__email__list_emails" not in email_anchors
+
+    # Candidate providers do not gain authority: the Broker still rejects a
+    # high-priority candidate outside the permitted controller set.
+    from assistant.fork.tool_broker import ToolCandidate
+
+    boundary_broker = ToolBroker(
+        [
+            ToolDescriptor(
+                "discover_tools",
+                frozenset({"tool:discover_tools"}),
+                core_visible=True,
+            ),
+            ToolDescriptor(
+                "allowed",
+                frozenset({"tool:allowed"}),
+            ),
+            ToolDescriptor(
+                "denied",
+                frozenset({"tool:denied"}),
+            ),
+        ],
+        max_visible=3,
+    )
+    boundary = boundary_broker.select_candidates(
+        permitted_names={"discover_tools", "allowed"},
+        candidates=[
+            ToolCandidate("denied", 999, 999.0, "malicious-provider"),
+            ToolCandidate("allowed", 10, 0.0, "test"),
+            ToolCandidate("discover_tools", 100, 0.0, "core-visible"),
+        ],
+    )
+    assert "denied" not in boundary.visible
+    assert "allowed" in boundary.visible
+
+    # Explicit topic switches suppress unrelated verified-history leases.
+    previous_email = _tool_history("mcp__email__list_emails")
+    cookbook_caps = broker_capabilities_for_domains({"cookbook"})
+    cookbook_after_email = preview_final_tool_visibility(
+        current={
+            "ask_user", "manage_memory", "update_plan",
+            "list_served_models",
+        },
+        messages=previous_email,
+        mcp_mgr=_FakeMcpManager(),
+        suggested_capabilities=cookbook_caps,
+        domain_members=_test_domain_members,
+        max_visible=10,
+    )
+    assert "list_served_models" in cookbook_after_email.tools
+    assert "mcp__email__list_emails" not in cookbook_after_email.tools
+
+    # A stray semantic browser candidate no longer expands the entire browser
+    # MCP server. Typed notes/reminder intent outranks that cross-domain noise.
+    reminder_caps = broker_capabilities_for_domains(
+        {"notes_calendar_tasks"}
+    )
+    reminder_with_browser_noise = preview_final_tool_visibility(
+        current={
+            "ask_user", "manage_memory", "update_plan",
+            "mcp__builtin_browser__browser_wait_for",
+        },
+        messages=[],
+        mcp_mgr=_FakeMcpManager(),
+        suggested_capabilities=reminder_caps,
+        domain_members=_test_domain_members,
+        max_visible=10,
+    )
+    assert "mcp__assistant_reminders__assistant_create_reminder" in (
+        reminder_with_browser_noise.tools
+    )
+    assert "mcp__assistant_reminders__assistant_cancel_reminder" in (
+        reminder_with_browser_noise.tools
+    )
+    assert "mcp__builtin_browser__browser_wait_for" not in (
+        reminder_with_browser_noise.tools
+    )
+
+    # Verified reminder history leases only the tight reminder sibling group,
+    # not every notes/calendar/task tool and not old email/Cookbook families.
+    reminder_history = _tool_history(
+        "mcp__assistant_reminders__assistant_create_reminder"
+    )
+    reminder_sticky, reminder_evidence = sticky_tools_from_history(
+        reminder_history,
+        mcp_mgr=_FakeMcpManager(),
+        suggested_capabilities=reminder_caps,
+        domain_members=_test_domain_members,
+    )
+    assert reminder_evidence == (
+        "mcp__assistant_reminders__assistant_create_reminder",
+    )
+    assert reminder_sticky == {
+        "mcp__assistant_reminders__assistant_create_reminder",
+        "mcp__assistant_reminders__assistant_list_reminders",
+        "mcp__assistant_reminders__assistant_cancel_reminder",
+    }
+
+    # The agent loop now delegates generic web/UI/settings/browser relevance to
+    # ToolCatalog/Broker; only real document/file/workspace context keeps direct
+    # selector mutation.
+    agent_source = (ROOT / "src" / "agent_loop.py").read_text(encoding="utf-8")
+    assert "v0.2.5 ToolCatalog selector boundary" in agent_source
+    assert "_expand_browser_mcp_tools(_relevant_tools, mcp_mgr)" not in agent_source
+    assert "_relevant_tools.update(WEB_TOOL_NAMES)" not in agent_source
+    assert '_relevant_tools.add("ui_control")' not in agent_source
+    assert "domain_members=_DOMAIN_TOOL_MAP" in agent_source
 
     # v0.2.4 discovery fallback is deterministic.
     from assistant.fork.tool_broker_runtime import _discovery_name_score
@@ -305,6 +485,16 @@ def main() -> None:
         "search_emails",
     }
 
+    # v0.2.5 schema-emission authority contract. Once Broker/model routing
+    # supplies a concrete set, no downstream admin/schema layer may add tools.
+    agent_source = (ROOT / "src" / "agent_loop.py").read_text(encoding="utf-8")
+    assert "if route_relevant_tools is not None:" in agent_source
+    assert "schema_names |= _ADMIN_TOOLS" not in agent_source
+    assert (
+        'if schema.get("function", {}).get("name") in schema_names'
+        in agent_source
+    )
+
     # Agent identity is provenance only; child delegation is explicit.
     ctx = ExecutionContext(agent_id="main", source="telegram", user_id="user-1", session_id="s1")
     child = ctx.child("homelab")
@@ -321,6 +511,11 @@ def main() -> None:
     print("  - MCP sibling tools survive natural follow-ups")
     print("  - sticky evidence expires after a short conversation window")
     print("  - discover-tools recovery path works")
+    print("  - ToolCatalog adapts Odysseus metadata instead of duplicating it")
+    print("  - candidate providers are signals; ToolBroker remains authority")
+    print("  - verified capability leases do not bleed across topic switches")
+    print("  - visibility has a bounded prompt budget + discovery escape hatch")
+    print("  - schema emission cannot expand Broker/model-route visibility")
     print("  - execution context is sub-agent-ready provenance")
 
 

@@ -66,6 +66,20 @@ class ToolSelection:
     reasons: Mapping[str, str]
 
 
+@dataclass(frozen=True, slots=True)
+class ToolCandidate:
+    """One relevance signal proposed to the Broker.
+
+    Providers may emit multiple signals for the same tool. The Broker keeps the
+    strongest signal after enforcing the controller-supplied permission set.
+    """
+
+    name: str
+    tier: int
+    score: float = 0.0
+    reason: str = "candidate"
+
+
 class ToolBroker:
     """Select visibility *within* a controller-supplied permission set.
 
@@ -101,6 +115,46 @@ class ToolBroker:
             out.append(name)
         return tuple(sorted(out))
 
+    def select_candidates(
+        self,
+        *,
+        permitted_names: set[str],
+        candidates: Iterable[ToolCandidate],
+    ) -> ToolSelection:
+        """Select from provider-produced candidates within controller permission."""
+        ranked: dict[str, tuple[int, float, str]] = {}
+
+        for candidate in candidates:
+            name = str(candidate.name or "").strip()
+            if name not in permitted_names or name not in self._tools:
+                continue
+            value = (
+                int(candidate.tier),
+                float(candidate.score),
+                str(candidate.reason or "candidate"),
+            )
+            current = ranked.get(name)
+            if current is None or (value[0], value[1]) > (current[0], current[1]):
+                ranked[name] = value
+
+        ordered = sorted(
+            ranked.items(),
+            key=lambda item: (-item[1][0], -item[1][1], item[0]),
+        )
+        visible = tuple(name for name, _ in ordered[: self.max_visible])
+        reasons = {name: ranked[name][2] for name in visible}
+        permitted_known = sorted(
+            name for name in permitted_names if name in self._tools
+        )
+        omitted = tuple(
+            name for name in permitted_known if name not in visible
+        )
+        return ToolSelection(
+            visible=visible,
+            omitted_permitted=omitted,
+            reasons=reasons,
+        )
+
     def select(
         self,
         *,
@@ -110,42 +164,54 @@ class ToolBroker:
         semantic_scores: Mapping[str, float] | None = None,
         forced_names: Sequence[str] = (),
     ) -> ToolSelection:
+        """Compatibility selector using the original v0.2.x signal contract."""
         semantic_scores = semantic_scores or {}
         suggested = {c for c in suggested_capabilities if c}
         sticky = set(state.active_capabilities)
+        candidates: list[ToolCandidate] = []
 
-        candidates: dict[str, tuple[int, float, str]] = {}
-
-        def consider(name: str, tier: int, score: float, reason: str) -> None:
-            if name not in permitted_names or name not in self._tools:
-                return
-            current = candidates.get(name)
-            value = (tier, score, reason)
-            if current is None or (tier, score) > (current[0], current[1]):
-                candidates[name] = value
-
-        # Small recovery/core set is stable regardless of embeddings/router health.
         for tool in self._tools.values():
             if tool.core_visible:
-                consider(tool.name, 100, 0.0, "core-visible")
+                candidates.append(
+                    ToolCandidate(tool.name, 100, 0.0, "core-visible")
+                )
 
-        # Explicit controller/context state outranks semantic ranking.
         for name in forced_names:
-            consider(name, 95, 0.0, "explicit-context")
+            candidates.append(
+                ToolCandidate(str(name), 95, 0.0, "explicit-context")
+            )
 
         for tool in self._tools.values():
             if tool.capabilities & sticky:
-                consider(tool.name, 90, 0.0, "sticky-capability")
+                candidates.append(
+                    ToolCandidate(
+                        tool.name,
+                        90,
+                        0.0,
+                        "sticky-capability",
+                    )
+                )
             elif tool.capabilities & suggested:
-                consider(tool.name, 70, 0.0, "router-suggestion")
+                candidates.append(
+                    ToolCandidate(
+                        tool.name,
+                        70,
+                        0.0,
+                        "router-suggestion",
+                    )
+                )
 
-        # Semantic retrieval is useful ranking, but never the sole availability path.
         for name, score in semantic_scores.items():
-            consider(name, 50, float(score), "semantic-rank")
+            candidates.append(
+                ToolCandidate(
+                    str(name),
+                    50,
+                    float(score),
+                    "semantic-rank",
+                )
+            )
 
-        ordered = sorted(candidates.items(), key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]))
-        visible = tuple(name for name, _ in ordered[: self.max_visible])
-        reasons = {name: candidates[name][2] for name in visible}
-        permitted_known = sorted(name for name in permitted_names if name in self._tools)
-        omitted = tuple(name for name in permitted_known if name not in visible)
-        return ToolSelection(visible=visible, omitted_permitted=omitted, reasons=reasons)
+        return self.select_candidates(
+            permitted_names=permitted_names,
+            candidates=candidates,
+        )
