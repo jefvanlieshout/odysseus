@@ -1,34 +1,36 @@
 # Assistant-owned components
 
-This directory contains project code that belongs to Jef's assistant rather than upstream Odysseus itself.
+This directory contains project code that belongs to Jef's assistant/fork rather than generic upstream Odysseus.
 
 Current layout:
-- `config/` — versioned assistant identity/config (`internal_id` is stable; display name is changeable)
+
+- `config/` — versioned assistant identity/config
 - `events/` — Python-authoritative event storage, state-aware notifications, persistent reminders
-- `telegram/` — Telegram chat bridge
+- `telegram/` — Telegram chat gateway
 - `connectors/` — controlled integrations such as Proxmox
+- `fork/` — fork-owned execution context + ToolBroker contracts
+- `docs/` — audit and design documents
+- `upstream/` — safe upstream maintenance policy
 - `tools/` — repository/update management helpers
 
-Root helper commands:
+Root helpers:
 
 ```bash
 ./events.sh start
 ./events.sh test
-./events.sh remind 10 "test reminder"
-./events.sh reminders
-./events.sh status
+./fork.sh prepare
+./fork.sh status
+./fork.sh self-test
+./upstream.sh status
 ```
 
 Architectural rule: models reason/propose; the Python/controller layer is authoritative about permissions, external actions, schedules, and what actually happened.
 
-## Qwen reminder tools (v0.1.4)
+## v0.2.0 fork foundation
 
-`assistant/mcp/reminders_server.py` is a thin stdio MCP bridge. Install/refresh it with:
+v0.2.0 deliberately does not rewrite the live Odysseus agent loop yet. It establishes a maintainable fork and a tested ToolBroker contract first. The current reminder MCP bridge remains available as an experimental adapter, but native controller reminders are planned for the first core fork patch.
 
-```bash
-./reminders.sh install
-```
+Read:
 
-Odysseus/Qwen then gets structured create/list/cancel reminder tools. The MCP
-bridge does not own timers or Telegram delivery; it calls `assistant-events`,
-which remains the authoritative scheduler and event database.
+- `docs/ODYSSEUS-AUDIT-2026-09-03.md`
+- `docs/TOOL-BROKER-DESIGN.md`
