@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""No-dependency contract tests for the fork foundation."""
+"""No-dependency contract tests for the assistant fork."""
 from __future__ import annotations
 
 import sys
@@ -16,6 +16,33 @@ from assistant.fork.tool_broker import (
     ToolDescriptor,
     ToolRisk,
 )
+from assistant.fork.tool_broker_runtime import (
+    apply_sticky_tool_visibility,
+    recent_authoritative_tool_names,
+    sticky_tools_from_history,
+)
+
+
+class _FakeMcpManager:
+    def get_all_tools(self):
+        return [
+            {"qualified_name": "mcp__assistant_reminders__assistant_create_reminder"},
+            {"qualified_name": "mcp__assistant_reminders__assistant_list_reminders"},
+            {"qualified_name": "mcp__assistant_reminders__assistant_cancel_reminder"},
+            {"qualified_name": "mcp__other__unrelated"},
+        ]
+
+
+def _tool_history(tool: str) -> list[dict]:
+    return [
+        {"role": "user", "content": "first request"},
+        {
+            "role": "assistant",
+            "content": "done",
+            "metadata": {"tool_events": [{"tool": tool, "output": "ok"}]},
+        },
+        {"role": "user", "content": "follow-up"},
+    ]
 
 
 def main() -> None:
@@ -40,7 +67,7 @@ def main() -> None:
     assert "calendar_read" in sel.visible
     assert "discover_tools" in sel.visible
 
-    # Sticky context survives a vague follow-up without matching a magic word.
+    # Typed sticky state survives a vague follow-up without matching a magic word.
     state.activate("calendar.read", "calendar.write")
     sel = broker.select(
         permitted_names={"discover_tools", "calendar_read", "calendar_write", "proxmox_read"},
@@ -48,12 +75,63 @@ def main() -> None:
     )
     assert "calendar_read" in sel.visible and "calendar_write" in sel.visible
 
-    # Discovery can recover a permitted capability omitted by the automatic selector.
+    # Discovery can recover a permitted capability omitted by auto selection.
     found = broker.discover(
         permitted_names={"discover_tools", "proxmox_read"},
         capabilities={"proxmox.read"},
     )
     assert found == ("proxmox_read",)
+
+    # Runtime state comes from authoritative persisted tool events, not prose.
+    messages = _tool_history("manage_calendar")
+    assert recent_authoritative_tool_names(messages) == ("manage_calendar",)
+    sticky, evidence = sticky_tools_from_history(messages)
+    assert evidence == ("manage_calendar",)
+    assert sticky == {"manage_calendar"}
+
+    # Disabled tools remain invisible even when recent history suggests them.
+    merged = apply_sticky_tool_visibility(
+        current={"ask_user"},
+        messages=messages,
+        disabled_tools={"manage_calendar"},
+    )
+    assert merged.tools == {"ask_user"}
+    assert not merged.added
+
+    # MCP follow-ups keep siblings from the same server, not unrelated servers.
+    mcp_messages = [
+        {"role": "user", "content": "remind me"},
+        {
+            "role": "assistant",
+            "content": "done",
+            "metadata": {
+                "tool_events": [{
+                    "tool": "mcp",
+                    "desc": "Called mcp__assistant_reminders__assistant_create_reminder",
+                    "output": "created",
+                }]
+            },
+        },
+        {"role": "user", "content": "cancel it"},
+    ]
+    sticky, _ = sticky_tools_from_history(mcp_messages, mcp_mgr=_FakeMcpManager())
+    assert sticky == {
+        "mcp__assistant_reminders__assistant_create_reminder",
+        "mcp__assistant_reminders__assistant_list_reminders",
+        "mcp__assistant_reminders__assistant_cancel_reminder",
+    }
+
+    # Sticky evidence expires after the configured conversational window.
+    stale = [
+        {"role": "user", "content": "calendar"},
+        {"role": "assistant", "metadata": {"tool_events": [{"tool": "manage_calendar"}]}},
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "normal answer"},
+        {"role": "user", "content": "two"},
+        {"role": "assistant", "content": "normal answer"},
+        {"role": "user", "content": "new topic"},
+    ]
+    assert recent_authoritative_tool_names(stale, previous_user_turns=2) == ()
 
     # Agent identity is provenance only; child delegation is explicit.
     ctx = ExecutionContext(agent_id="main", source="telegram", user_id="user-1", session_id="s1")
@@ -65,7 +143,11 @@ def main() -> None:
 
     print("✓ assistant fork contracts: PASS")
     print("  - visibility cannot bypass controller permissions")
-    print("  - sticky capability state works without keyword matching")
+    print("  - typed sticky capability state works without keyword matching")
+    print("  - persisted tool events drive runtime sticky visibility")
+    print("  - disabled tools remain hidden")
+    print("  - MCP sibling tools survive natural follow-ups")
+    print("  - sticky evidence expires after a short conversation window")
     print("  - discover-tools recovery path works")
     print("  - execution context is sub-agent-ready provenance")
 

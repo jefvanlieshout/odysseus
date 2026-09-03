@@ -4027,6 +4027,31 @@ async def stream_agent_loop(
     if not guide_only and _relevant_tools is not None:
         _relevant_tools = _expand_browser_mcp_tools(_relevant_tools, mcp_mgr)
 
+    # Assistant fork: real tool executions keep a capability visible briefly
+    # for natural follow-ups (for example, calendar -> "move the first one").
+    # This is visibility only; Odysseus authorization/approval remains authority.
+    if not guide_only:
+        try:
+            from assistant.fork.tool_broker_runtime import apply_sticky_tool_visibility
+            _sticky_visibility = apply_sticky_tool_visibility(
+                current=_relevant_tools,
+                messages=messages,
+                disabled_tools=disabled_tools,
+                mcp_mgr=mcp_mgr,
+            )
+            _relevant_tools = _sticky_visibility.tools
+            if _sticky_visibility.added:
+                logger.info(
+                    "[tool-broker] sticky tools=%s evidence=%s",
+                    list(_sticky_visibility.added),
+                    list(_sticky_visibility.evidence),
+                )
+        except Exception as _e:
+            logger.warning(
+                "[tool-broker] sticky visibility failed; keeping selector output: %s",
+                _e,
+            )
+
     # The skill index injected by _build_system_prompt tells the model to
     # call `manage_skills action=view`, and Jaccard-matched skills are pasted
     # into the prompt as procedures to follow — but neither path goes through
