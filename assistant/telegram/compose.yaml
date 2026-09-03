@@ -1,0 +1,21 @@
+services:
+  telegram-bridge:
+    build: .
+    container_name: odysseus-telegram-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - odysseus
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  odysseus:
+    external: true
+    name: ${ODYSSEUS_NETWORK:-odysseus_default}
