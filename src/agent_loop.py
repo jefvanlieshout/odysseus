@@ -571,7 +571,7 @@ _DOMAIN_TOOL_MAP = {
     "web": set(WEB_TOOL_NAMES),
     "documents": {"create_document", "edit_document", "update_document", "suggest_document", "manage_documents"},
     "email": {"list_email_accounts", "list_emails", "read_email", "scan_email_unsubscribes", "unsubscribe_email", "send_email", "reply_to_email", "bulk_email", "archive_email", "delete_email", "mark_email_read", "resolve_contact", "manage_contact"},
-    "cookbook": {"download_model", "serve_model", "serve_preset", "list_serve_presets", "list_served_models", "stop_served_model", "tail_serve_output", "list_downloads", "cancel_download", "search_hf_models", "list_cached_models", "list_cookbook_servers", "adopt_served_model"},
+    "cookbook": {"download_model", "serve_model", "serve_preset", "list_serve_presets", "list_served_models", "stop_served_model", "tail_serve_output", "list_downloads", "cancel_download", "search_hf_models", "list_cached_models", "list_cookbook_servers", "adopt_served_model", "list_models"},
     "notes_calendar_tasks": {"manage_notes", "manage_calendar", "manage_tasks"},
     "ui": {"ui_control"},
     "sessions": {"create_session", "list_sessions", "manage_session", "send_to_session", "search_chats"},
@@ -3584,6 +3584,32 @@ async def stream_agent_loop(
         temperature = _ody_qwen_temperature_cap(temperature)
     _ody_memory_identity_turn = _looks_like_memory_identity_turn(_last_user)
     _intent = _classify_agent_request(messages, _last_user)
+    # v0.2.6 selector quality: compare conversational classification with the
+    # latest turn in isolation. A genuinely explicit new topic must not inherit
+    # old reminder/email/etc. context merely because the history looks related.
+    try:
+        from assistant.fork.selector_quality import refine_intent_for_selection
+        _latest_only_intent = _classify_agent_request(
+            [{"role": "user", "content": _last_user}],
+            _last_user,
+        )
+        _intent = refine_intent_for_selection(
+            _intent,
+            _latest_only_intent,
+            _last_user,
+        )
+        if _intent.get("selection_refined"):
+            logger.info(
+                "[tool-quality] intent reset reason=%s latest=%r domains=%s",
+                _intent.get("selection_refine_reason"),
+                _last_user[:120],
+                sorted(_intent.get("domains") or []),
+            )
+    except Exception as _quality_intent_error:
+        logger.debug(
+            "[tool-quality] latest-only intent refinement skipped: %s",
+            _quality_intent_error,
+        )
     _low_signal_turn = bool(_intent.get("low_signal"))
     _casual_low_signal_turn = _is_casual_low_signal(_last_user)
     _existing_conversation = _user_turn_count(messages) > 1
@@ -4058,11 +4084,17 @@ async def stream_agent_loop(
     # Current-turn chat uploads are real files under the upload/data root. Make
     # the read-side file/document tools visible immediately so the agent can
     # inspect files whose inline text was truncated or omitted.
+    # v0.2.6: runtime context is stronger than semantic domain relevance.
+    # Track it separately so cross-domain pruning can never discard helpers
+    # explicitly required by an upload or caller context.
+    _broker_explicit_context_tools = set(forced_tools or set())
     if not guide_only and uploaded_files:
         if _relevant_tools is None:
             from src.tool_index import ALWAYS_AVAILABLE
             _relevant_tools = set(ALWAYS_AVAILABLE)
-        _relevant_tools.update({"read_file", "grep", "ls", "manage_documents"})
+        _uploaded_context_tools = {"read_file", "grep", "ls", "manage_documents"}
+        _relevant_tools.update(_uploaded_context_tools)
+        _broker_explicit_context_tools.update(_uploaded_context_tools)
 
 
     # v0.2.5 browser MCP tools are ordinary catalog candidates. A stray
@@ -4095,6 +4127,7 @@ async def stream_agent_loop(
             _owner_skills = _sm.load(owner=owner) if _skills_on else []
             if _owner_skills:
                 _relevant_tools.add("manage_skills")
+                _broker_explicit_context_tools.add("manage_skills")
                 if _retrieval_query:
                     # Validate against every known executable tool, not just
                     # TOOL_SECTIONS — code-nav tools (grep/glob/ls) ship as
@@ -4105,10 +4138,12 @@ async def stream_agent_loop(
                         _retrieval_query, skills=_owner_skills,
                         threshold=0.25, max_items=3,
                     ):
-                        _relevant_tools.update(
+                        _matched_skill_tools = {
                             t for t in (_sk.get("requires_toolsets") or [])
                             if t in _known
-                        )
+                        }
+                        _relevant_tools.update(_matched_skill_tools)
+                        _broker_explicit_context_tools.update(_matched_skill_tools)
         except Exception as _e:
             logger.debug(f"[tool-rag] skill-aware tool include skipped: {_e}")
 
@@ -4128,19 +4163,20 @@ async def stream_agent_loop(
                 messages=messages,
                 disabled_tools=disabled_tools,
                 mcp_mgr=mcp_mgr,
-                forced_names=forced_tools or set(),
+                forced_names=_broker_explicit_context_tools,
                 suggested_capabilities=_broker_suggested_capabilities,
                 domain_members=_DOMAIN_TOOL_MAP,
             )
             logger.info(
                 "[tool-broker] final current=%s selected=%s added=%s removed=%s "
-                "evidence=%s reasons=%s",
+                "evidence=%s reasons=%s diagnostics=%s",
                 sorted(_relevant_tools),
                 sorted(_broker_preview.tools),
                 list(_broker_preview.added),
                 list(_broker_preview.removed),
                 list(_broker_preview.evidence),
                 dict(_broker_preview.reasons),
+                dict(_broker_preview.diagnostics or {}),
             )
             # v0.2.3 broker final visibility active
             _relevant_tools = set(_broker_preview.tools)
@@ -4572,6 +4608,15 @@ async def stream_agent_loop(
     # backstop. Counting identical repeats — not distinct same-tool calls —
     # lets a legit batch (e.g. 18 calendar events at once) through.
     _call_freq: collections.Counter = collections.Counter()
+    # v0.2.6 convergence cache: identical successful read-only calls are
+    # reusable within this turn. Any successful non-cacheable action clears the
+    # cache because it may have changed the state those reads observe.
+    from assistant.fork.selector_quality import (
+        action_is_cacheable_read,
+        canonical_tool_call_signature,
+    )
+    _successful_read_call_sigs: set[str] = set()
+    _duplicate_read_suppressions = 0
     _force_answer = False  # set by loop-breaker → next round runs with NO tools
     # Supervisor: how many times we've nudged the model after it announced
     # an action without emitting the tool call. Capped to prevent a model
@@ -4889,6 +4934,18 @@ async def stream_agent_loop(
             approved_tool_event["doc_id"] = approved_result["doc_id"]
             approved_tool_event["doc_title"] = approved_result.get("title", "")
         tool_events.append(approved_tool_event)
+        if tool_result_is_successful(approved_result):
+            _approved_quality_sig = canonical_tool_call_signature(
+                approved.tool_name,
+                approved.content,
+            )
+            if action_is_cacheable_read(
+                approved.tool_name,
+                approved.content,
+            ):
+                _successful_read_call_sigs.add(_approved_quality_sig)
+            else:
+                _successful_read_call_sigs.clear()
         if approved.tool_name in _VERIFIER_EFFECTFUL_TOOLS:
             _effectful_used = True
         formatted_approved_result = format_tool_result(desc, approved_result)
@@ -5711,6 +5768,48 @@ async def stream_agent_loop(
         # rounds (just "<think>\n\n</think>" + a tool call) must not read as
         # progress, so strip think before checking.
         _real_text = _strip_think_blocks(cleaned_round).strip()
+
+        # v0.2.6: if the model asks to repeat only read calls whose identical
+        # signatures already succeeded in this turn, do not hit the backend
+        # again. The previous results are already in model context; force one
+        # tool-free convergence round instead. Failed calls are never cached.
+        _repeat_successful_read_batch = bool(
+            not _real_text
+            and tool_blocks
+            and all(
+                action_is_cacheable_read(_b.tool_type, _b.content)
+                and canonical_tool_call_signature(
+                    _b.tool_type,
+                    _b.content,
+                ) in _successful_read_call_sigs
+                for _b in tool_blocks
+            )
+        )
+        if _repeat_successful_read_batch:
+            _duplicate_read_suppressions += len(tool_blocks)
+            logger.info(
+                "[tool-quality] suppressed duplicate successful read batch "
+                "round=%s count=%s total_suppressed=%s tools=%s",
+                round_num,
+                len(tool_blocks),
+                _duplicate_read_suppressions,
+                [block.tool_type for block in tool_blocks],
+            )
+            _force_answer = True
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Those exact read-only tool calls already succeeded earlier "
+                    "in this turn and their results are already in context. Do "
+                    "not call them again. Answer the user now from the existing "
+                    "tool results; if genuinely blocked, state what is missing."
+                ),
+            })
+            yield (
+                f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+            )
+            continue
+
         # Circling = repeating a recent call with nothing written. Any
         # progress (a NEW distinct call, or actual answer text) resets it.
         if _is_repeat and not _real_text:
@@ -5973,6 +6072,21 @@ async def stream_agent_loop(
                             pass
 
             run_security.observe_tool_result(block.tool_type, result, block.content)
+
+            if tool_result_is_successful(result):
+                _quality_sig = canonical_tool_call_signature(
+                    block.tool_type,
+                    block.content,
+                )
+                if action_is_cacheable_read(
+                    block.tool_type,
+                    block.content,
+                ):
+                    _successful_read_call_sigs.add(_quality_sig)
+                else:
+                    # A successful write/side effect/admin action can invalidate
+                    # earlier reads, so identical reads are allowed again.
+                    _successful_read_call_sigs.clear()
 
 
             # v0.2.4 real discover_tools recovery.

@@ -10,6 +10,7 @@ selector remains the cold-start selector during the migration to ToolBroker.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import re
 from typing import Any, Iterable, Mapping, Sequence
@@ -215,6 +216,7 @@ class BrokerVisibilityPreview:
     evidence: tuple[str, ...]
     reasons: Mapping[str, str]
     budget: int | None = None
+    diagnostics: Mapping[str, int] | None = None
 
 
 # v0.2.3 typed cold-start capability recovery
@@ -299,6 +301,12 @@ def preview_final_tool_visibility(
             removed=tuple(sorted(current_set)),
             evidence=evidence,
             reasons={},
+            budget=0,
+            diagnostics={
+                "candidate_total": 0,
+                "selected_total": 0,
+                "cross_domain_suppressed": 0,
+            },
         )
 
     descriptors = [
@@ -332,12 +340,35 @@ def preview_final_tool_visibility(
     )
     proposed = set(selection.visible)
 
+    candidate_reason_counts = Counter(
+        candidate.reason for candidate in plan.candidates
+    )
+    selected_reason_counts = Counter(selection.reasons.values())
+    diagnostics: dict[str, int] = {
+        "budget": int(plan.budget),
+        "candidate_total": len({
+            candidate.name for candidate in plan.candidates
+        }),
+        "selected_total": len(proposed),
+        "cross_domain_suppressed": len(plan.suppressed_cross_domain),
+    }
+    diagnostics.update({
+        f"candidate:{reason}": int(count)
+        for reason, count in candidate_reason_counts.items()
+    })
+    diagnostics.update({
+        f"selected:{reason}": int(count)
+        for reason, count in selected_reason_counts.items()
+    })
+
     return BrokerVisibilityPreview(
         tools=proposed,
         added=tuple(sorted(proposed - current_set)),
         removed=tuple(sorted(current_set - proposed)),
         evidence=evidence,
         reasons=dict(selection.reasons),
+        budget=plan.budget,
+        diagnostics=diagnostics,
     )
 
 

@@ -253,12 +253,14 @@ def main() -> None:
         "web": {"web_search", "web_fetch"},
         "email": {
             "list_email_accounts", "list_emails", "read_email",
-            "resolve_contact", "manage_contact",
+            "scan_email_unsubscribes", "unsubscribe_email", "send_email",
+            "reply_to_email", "bulk_email", "archive_email", "delete_email",
+            "mark_email_read", "resolve_contact", "manage_contact",
         },
         "contacts": {"resolve_contact", "manage_contact"},
         "cookbook": {
             "list_served_models", "list_cached_models",
-            "tail_serve_output", "serve_model",
+            "tail_serve_output", "serve_model", "list_models",
         },
         "notes_calendar_tasks": {
             "manage_notes", "manage_calendar", "manage_tasks",
@@ -495,6 +497,177 @@ def main() -> None:
         in agent_source
     )
 
+    # v0.2.6 selection quality: known cross-domain retrieval is pruned, not
+    # merely demoted until a generous budget happens to admit it.
+    quality_reminder = preview_final_tool_visibility(
+        current={
+            "ask_user", "manage_memory", "update_plan", "manage_notes",
+            "list_served_models", "manage_mcp", "reply_to_email",
+            "mcp__builtin_browser__browser_wait_for",
+            "mcp__assistant_reminders__assistant_create_reminder",
+            "mcp__assistant_reminders__assistant_list_reminders",
+            "mcp__assistant_reminders__assistant_cancel_reminder",
+        },
+        messages=[],
+        mcp_mgr=_FakeMcpManager(),
+        suggested_capabilities=reminder_caps,
+        domain_members=_test_domain_members,
+    )
+    assert {
+        "list_served_models",
+        "manage_mcp",
+        "reply_to_email",
+        "mcp__builtin_browser__browser_wait_for",
+    }.isdisjoint(quality_reminder.tools)
+    assert {
+        "mcp__assistant_reminders__assistant_create_reminder",
+        "mcp__assistant_reminders__assistant_list_reminders",
+        "mcp__assistant_reminders__assistant_cancel_reminder",
+    } <= quality_reminder.tools
+    assert quality_reminder.budget is not None
+    assert quality_reminder.budget <= 20
+    assert quality_reminder.diagnostics
+    assert quality_reminder.diagnostics["cross_domain_suppressed"] >= 4
+
+    # The old v0.2.5 preview forgot to propagate its real budget.
+    quality_wide = preview_final_tool_visibility(
+        current=wide_current,
+        messages=[],
+    )
+    assert quality_wide.budget is not None
+    assert quality_wide.budget <= 20
+    assert quality_wide.diagnostics["selected_total"] == len(
+        quality_wide.tools
+    )
+
+    # Explicit latest-turn topics reset inherited continuation context, while
+    # genuinely vague follow-ups retain the conversational interpretation.
+    from assistant.fork.selector_quality import (
+        action_is_cacheable_read,
+        canonical_tool_call_signature,
+        refine_intent_for_selection,
+    )
+
+    refined = refine_intent_for_selection(
+        {
+            "continuation": True,
+            "low_signal": False,
+            "domains": {"cookbook", "notes_calendar_tasks"},
+            "retrieval_query": (
+                "inspect failed model serve\n"
+                "actually cancel that reminder"
+            ),
+        },
+        {
+            "continuation": False,
+            "low_signal": False,
+            "domains": {"cookbook"},
+            "retrieval_query": "inspect failed model serve",
+        },
+        "inspect failed model serve",
+    )
+    assert refined["continuation"] is False
+    assert refined["domains"] == {"cookbook"}
+    assert refined["retrieval_query"] == "inspect failed model serve"
+
+    vague = refine_intent_for_selection(
+        {
+            "continuation": True,
+            "low_signal": True,
+            "domains": {"notes_calendar_tasks"},
+            "retrieval_query": "cancel it\nremind me tomorrow",
+        },
+        {
+            "continuation": True,
+            "low_signal": True,
+            "domains": set(),
+            "retrieval_query": "cancel it",
+        },
+        "cancel it",
+    )
+    assert vague["continuation"] is True
+    assert vague["domains"] == {"notes_calendar_tasks"}
+
+    # Duplicate-call suppression only applies to deterministic/cacheable reads.
+    assert canonical_tool_call_signature(
+        "list_emails",
+        '{"max_results":3,"unread_only":false}',
+    ) == canonical_tool_call_signature(
+        "list_emails",
+        '{"unread_only": false, "max_results": 3}',
+    )
+    assert action_is_cacheable_read(
+        "list_emails",
+        '{"max_results":3}',
+    )
+    assert action_is_cacheable_read(
+        "manage_calendar",
+        '{"action":"list_events"}',
+    )
+    assert not action_is_cacheable_read(
+        "manage_calendar",
+        '{"action":"create_event"}',
+    )
+    assert not action_is_cacheable_read(
+        "delete_email",
+        '{"uid":"1"}',
+    )
+
+    # Explicit runtime context survives typed-domain pruning.
+    explicit_file_context = preview_final_tool_visibility(
+        current={
+            "ask_user", "manage_memory", "update_plan",
+            "grep", "list_served_models",
+        },
+        messages=[],
+        forced_names={"grep"},
+        suggested_capabilities=reminder_caps,
+        domain_members=_test_domain_members,
+    )
+    assert "grep" in explicit_file_context.tools
+    assert "list_served_models" not in explicit_file_context.tools
+
+    agent_source = (ROOT / "src" / "agent_loop.py").read_text(
+        encoding="utf-8"
+    )
+    assert "[tool-quality] intent reset" in agent_source
+    assert "suppressed duplicate successful read batch" in agent_source
+    assert "diagnostics=%s" in agent_source
+    assert (
+        "_broker_explicit_context_tools.update(_uploaded_context_tools)"
+        in agent_source
+    )
+    assert '_broker_explicit_context_tools.add("manage_skills")' in agent_source
+
+    chat_source = (ROOT / "routes" / "chat_routes.py").read_text(
+        encoding="utf-8"
+    )
+    assert "if _search_enabled and _explicit_web_intent:" in chat_source
+    assert '_tool_intent.category == "web"' in chat_source
+    assert (
+        "latest|current|today|news|weather|forecast|rate"
+        not in chat_source
+    )
+
+    # list_models now has Cookbook provenance, so an explicit web turn drops
+    # it as known cross-domain noise instead of keeping it unclassified.
+    web_quality = preview_final_tool_visibility(
+        current={
+            "ask_user", "manage_memory", "update_plan",
+            "web_search", "web_fetch", "list_models",
+        },
+        messages=[],
+        suggested_capabilities=broker_capabilities_for_domains({"web"}),
+        domain_members=_test_domain_members,
+    )
+    assert {"web_search", "web_fetch"} <= web_quality.tools
+    assert "list_models" not in web_quality.tools
+    assert (
+        "if _search_enabled:\n"
+        "                        _forced_tools = set(WEB_TOOL_NAMES)"
+        not in chat_source
+    )
+
     # Agent identity is provenance only; child delegation is explicit.
     ctx = ExecutionContext(agent_id="main", source="telegram", user_id="user-1", session_id="s1")
     child = ctx.child("homelab")
@@ -516,6 +689,10 @@ def main() -> None:
     print("  - verified capability leases do not bleed across topic switches")
     print("  - visibility has a bounded prompt budget + discovery escape hatch")
     print("  - schema emission cannot expand Broker/model-route visibility")
+    print("  - typed turns hard-prune known cross-domain retrieval noise")
+    print("  - explicit latest topics reset false continuation inheritance")
+    print("  - repeated successful reads converge without backend re-execution")
+    print("  - selector telemetry reports real budgets and suppression counts")
     print("  - execution context is sub-agent-ready provenance")
 
 

@@ -28,6 +28,7 @@ class CandidatePlan:
     candidates: tuple[ToolCandidate, ...]
     evidence: tuple[str, ...]
     budget: int
+    suppressed_cross_domain: tuple[str, ...] = ()
 
 
 def _domain_caps(capabilities: Iterable[str]) -> set[str]:
@@ -74,13 +75,15 @@ def visibility_budget(
     if override is not None:
         return max(1, int(override))
 
-    base = 20 if explicit_domains else 24
-    # Never let a normal forced/core footprint consume the entire budget.
-    floor = core_count + forced_count + 6
-    # A larger semantic candidate set earns a little room but does not grow
-    # without bound.  This is the first deliberate prompt budget in v0.2.5.
-    adaptive = min(24, max(12, current_count + 6))
-    return max(floor, min(24, max(base, adaptive)))
+    # v0.2.6: discovery is mature enough that normal prompts can optimize
+    # for precision instead of keeping a broad recall-heavy schema surface.
+    base = 16 if explicit_domains else 20
+    required = core_count + forced_count
+    adaptive = min(20, max(10, current_count + 4))
+    # Explicit/core context remains protected. Only an unusually large forced
+    # footprint may push beyond the ordinary 20-schema ceiling.
+    ceiling = max(20, required)
+    return min(ceiling, max(required, base, adaptive))
 
 
 def build_candidate_plan(
@@ -101,6 +104,7 @@ def build_candidate_plan(
     suggested_domains = _domain_caps(suggested)
 
     out: list[ToolCandidate] = []
+    suppressed_cross_domain: set[str] = set()
 
     # Stable recovery surface.
     for name in sorted(core):
@@ -155,10 +159,14 @@ def build_candidate_plan(
                 tier = 74
                 reason = "retrieval-domain-match"
             elif record_domains:
-                tier = 38
-                reason = "retrieval-cross-domain"
+                # v0.2.6: a tool classified into a different known domain is
+                # noise on an explicitly typed turn. Multi-domain requests are
+                # represented by multiple suggested domains; discover_tools is
+                # the recovery path for genuine misses.
+                suppressed_cross_domain.add(name)
+                continue
             else:
-                tier = 58
+                tier = 54
                 reason = "retrieval-unclassified"
         else:
             tier = 70
@@ -182,4 +190,5 @@ def build_candidate_plan(
         candidates=tuple(out),
         evidence=tuple(str(name) for name in evidence_names if str(name)),
         budget=budget,
+        suppressed_cross_domain=tuple(sorted(suppressed_cross_domain)),
     )

@@ -998,14 +998,26 @@ def setup_chat_routes(
         # not chats we quietly promoted for a notes/calendar intent.
         user_requested_agent = (chat_mode == "agent")
         _search_enabled = web_search_enabled_for_turn(allow_web_search, use_web)
-        _explicit_web_intent = False
+
+        # v0.2.6 final classifier cleanup:
+        # Use the existing conservative action-intent classifier as the single
+        # source for web intent. A second broad regex used to treat bare words
+        # such as "latest", "current", "today", and even generic "search" as
+        # web intent, which made "latest emails" force web schemas.
+        _tool_intent = (
+            _classify_tool_intent(message)
+            if isinstance(message, str)
+            else None
+        )
+        _explicit_web_intent = bool(
+            _tool_intent
+            and _tool_intent.needs_tools
+            and _tool_intent.category == "web"
+        )
+
         _explicit_browser_intent = False
         if isinstance(message, str):
             _msg_l = message.lower()
-            _explicit_web_intent = bool(re.search(
-                r"\b(search|look\s*up|lookup|google|browse|web|online|latest|current|today|news|weather|forecast|rate|exchange\s+rate)\b",
-                _msg_l,
-            ))
             _explicit_browser_intent = bool(re.search(
                 r"\b(browser|browse|open\s+(?:the\s+)?(?:site|page|url|link)|"
                 r"click|fill(?:\s+out)?|submit|send\s+(?:the\s+)?form|"
@@ -1025,7 +1037,6 @@ def setup_chat_routes(
         # its way through a plain chat request (and fail, especially with the
         # shell disabled).
         auto_escalated = False
-        _tool_intent = _classify_tool_intent(message) if isinstance(message, str) else None
         _workspace_agent_intent = False
         if chat_mode == "chat" and _tool_intent and _tool_intent.needs_tools:
             chat_mode = "agent"
@@ -2284,12 +2295,16 @@ def setup_chat_routes(
                     _max_rounds = max(1, min(_max_rounds, 200))
 
                     _forced_tools = None
-                    if _search_enabled:
+                    # v0.2.6: enabled means permitted, not relevant. Web tools
+                    # are forced only for an explicit/contextual web turn;
+                    # otherwise ToolCatalog/Broker may still select them when
+                    # the typed intent or semantic retrieval actually needs web.
+                    if _search_enabled and _explicit_web_intent:
                         _forced_tools = set(WEB_TOOL_NAMES)
-                        if _explicit_browser_intent:
-                            _forced_tools |= set(_BROWSER_MCP_TOOLS)
-                    elif _explicit_browser_intent:
-                        _forced_tools = set(_BROWSER_MCP_TOOLS)
+                    if _explicit_browser_intent:
+                        if _forced_tools is None:
+                            _forced_tools = set()
+                        _forced_tools |= set(_BROWSER_MCP_TOOLS)
 
                     async for chunk in stream_agent_loop(
                         sess.endpoint_url,
