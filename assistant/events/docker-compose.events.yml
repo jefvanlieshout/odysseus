@@ -1,0 +1,20 @@
+services:
+  assistant-events:
+    build:
+      context: ./assistant-events
+      dockerfile: Dockerfile
+    env_file:
+      - ./assistant-events/.env
+    volumes:
+      - assistant-events-data:/data
+    ports:
+      - "127.0.0.1:${ASSISTANT_EVENTS_PORT:-8780}:8780"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  assistant-events-data:

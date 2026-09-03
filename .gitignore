@@ -120,3 +120,36 @@ compound.config.json
 *.error.log
 _scratch/
 /odysseus/
+
+# >>> assistant-stack local/private state >>>
+# Real credentials and local config
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Runtime databases/data should never be Git source code
+brain-data/
+**/brain-data/
+assistant/**/data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Keys/certificates/tokens
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime/build noise
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+assistant/.state/
+# <<< assistant-stack local/private state <<<

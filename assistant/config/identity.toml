@@ -1,0 +1,7 @@
+[assistant]
+# Stable internal ID. Keep this stable even when the display name changes.
+internal_id = "main"
+
+# Temporary human-facing name. This can be changed later without changing IDs,
+# tool ownership, event provenance, or future sub-agent routing.
+display_name = "Jarvis"
