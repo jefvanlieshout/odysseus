@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 from urllib.request import urlopen
 
 PROJECT = "assistant-stack"
-FORMAT_VERSION = 1
+SUPPORTED_FORMAT_VERSIONS = {1, 2}
+LATEST_FORMAT_VERSION = 2
 VERSION_FILE = "ASSISTANT_VERSION"
 
 DENY_PARTS = {
@@ -118,14 +119,22 @@ def load_manifest(root: Path) -> dict:
     if not path.is_file():
         raise ValueError("Update archive has no manifest.json")
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("format_version") != FORMAT_VERSION:
-        raise ValueError(f"Unsupported update format: {data.get('format_version')!r}")
+    format_version = data.get("format_version")
+    if format_version not in SUPPORTED_FORMAT_VERSIONS:
+        raise ValueError(
+            f"Unsupported update format: {format_version!r}; "
+            f"supported={sorted(SUPPORTED_FORMAT_VERSIONS)}"
+        )
     if data.get("project") != PROJECT:
         raise ValueError(f"Wrong project: {data.get('project')!r}")
     if not isinstance(data.get("to_version"), str) or not data["to_version"].strip():
         raise ValueError("Manifest has no valid to_version")
     if not isinstance(data.get("files", []), list) or not isinstance(data.get("delete", []), list):
         raise ValueError("Manifest files/delete fields must be lists")
+    if not isinstance(data.get("patches", []), list):
+        raise ValueError("Manifest patches field must be a list")
+    if format_version < 2 and data.get("patches"):
+        raise ValueError("Patch payloads require update format_version 2")
     return data
 
 
@@ -161,6 +170,93 @@ def verify_payload(extracted: Path, manifest: dict) -> list[tuple[Path, Path, in
         if is_secret_path(rel):
             raise ValueError(f"Update packages may not delete secret/runtime data: {rel}")
     return verified
+
+
+def verify_patches(extracted: Path, manifest: dict) -> list[tuple[Path, Path, tuple[Path, ...]]]:
+    """Verify patch payload hashes and their declared repository targets.
+
+    Format-v2 patches are intentionally limited to already-tracked files.
+    New files still travel through the normal ``files`` manifest, which keeps
+    patch application narrow and makes rollback deterministic.
+    """
+    verified: list[tuple[Path, Path, tuple[Path, ...]]] = []
+    seen_payloads: set[Path] = set()
+    for item in manifest.get("patches", []):
+        if not isinstance(item, dict):
+            raise ValueError("Each patches entry must be an object")
+        rel = safe_rel(str(item.get("path", "")))
+        if rel in seen_payloads:
+            raise ValueError(f"Duplicate patch payload in manifest: {rel}")
+        seen_payloads.add(rel)
+        src = extracted / "patches" / rel
+        if not src.is_file():
+            raise ValueError(f"Patch payload missing: {rel}")
+        expected = str(item.get("sha256", "")).lower()
+        actual = sha256_file(src)
+        if expected != actual:
+            raise ValueError(f"SHA256 mismatch for patch {rel}: expected {expected}, got {actual}")
+        raw_targets = item.get("targets", [])
+        if not isinstance(raw_targets, list) or not raw_targets:
+            raise ValueError(f"Patch {rel} must declare at least one target")
+        targets = tuple(safe_rel(str(raw)) for raw in raw_targets)
+        if len(set(targets)) != len(targets):
+            raise ValueError(f"Patch {rel} declares duplicate targets")
+        bad = [target for target in targets if is_secret_path(target)]
+        if bad:
+            raise ValueError(f"Patch {rel} targets secret/runtime-looking path(s): {bad}")
+        verified.append((rel, src, targets))
+    return verified
+
+
+def patch_touched_paths(repo: Path, patch_src: Path) -> tuple[Path, ...]:
+    """Ask Git which paths a patch would touch, without applying it."""
+    result = run(
+        ["git", "apply", "--numstat", "-z", str(patch_src)],
+        cwd=repo,
+        capture=True,
+    )
+    paths: list[Path] = []
+    for record in result.stdout.split("\0"):
+        if not record:
+            continue
+        parts = record.split("\t", 2)
+        if len(parts) != 3:
+            raise RuntimeError(f"Could not parse git apply --numstat output: {record!r}")
+        rel = safe_rel(parts[2])
+        paths.append(rel)
+    if not paths:
+        raise RuntimeError(f"Patch contains no file changes: {patch_src.name}")
+    return tuple(paths)
+
+
+def apply_verified_patch(
+    repo: Path,
+    patch_src: Path,
+    declared_targets: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    actual_targets = patch_touched_paths(repo, patch_src)
+    if set(actual_targets) != set(declared_targets):
+        raise RuntimeError(
+            f"Patch target mismatch for {patch_src.name}: "
+            f"declared={sorted(map(str, declared_targets))}, "
+            f"actual={sorted(map(str, actual_targets))}"
+        )
+    for rel in actual_targets:
+        if not is_tracked(repo, rel):
+            raise RuntimeError(
+                f"Format-v2 patches may only modify already-tracked files: {rel}"
+            )
+        ensure_update_path_safe(repo, rel)
+
+    run(
+        ["git", "apply", "--check", "--whitespace=error-all", str(patch_src)],
+        cwd=repo,
+    )
+    run(
+        ["git", "apply", "--whitespace=error-all", str(patch_src)],
+        cwd=repo,
+    )
+    return actual_targets
 
 
 def staged_paths(repo: Path) -> list[Path]:
@@ -365,6 +461,7 @@ def main() -> int:
                     f"This update expects one of {allowed!r}; installed version is {current_version!r}."
                 )
             verified = verify_payload(extracted, manifest)
+            verified_patches = verify_patches(extracted, manifest)
 
             print(f"Assistant update: {current_version} -> {target_version}")
             print(manifest.get("message", "(no description)"))
@@ -403,6 +500,11 @@ def main() -> int:
                         shutil.copy2(dst, backup)
                         dst.unlink()
                     touched.append(rel)
+
+                for patch_rel, patch_src, targets in verified_patches:
+                    print(f"Applying verified Git patch: {patch_rel}")
+                    patched = apply_verified_patch(repo, patch_src, targets)
+                    touched.extend(patched)
 
                 version_path.write_text(target_version + "\n", encoding="utf-8")
                 touched.append(Path(VERSION_FILE))

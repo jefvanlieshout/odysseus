@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small maintainer utility for building format-v1 assistant update archives."""
+"""Small maintainer utility for building assistant update archives (format v2 when patches are present)."""
 from __future__ import annotations
 
 import argparse
@@ -35,13 +35,21 @@ def main() -> int:
         "--delete", action="append", default=[], metavar="PATH",
         help="Repository-relative file to remove. Repeat for multiple files.",
     )
+    p.add_argument(
+        "--patch", action="append", default=[], metavar="PATCH=TARGET[,TARGET...]",
+        help=(
+            "Include a unified Git patch and declare the already-tracked repository "
+            "paths it may modify. Repeat for multiple patches."
+        ),
+    )
     p.add_argument("paths", nargs="*")
     a = p.parse_args()
-    if not a.paths and not a.delete:
-        raise SystemExit("An update must contain at least one changed or deleted file.")
+    if not a.paths and not a.delete and not a.patch:
+        raise SystemExit("An update must contain at least one changed, deleted, or patched file.")
 
     root = Path.cwd().resolve()
     files = []
+    patches = []
     deletes = [safe_rel(raw).as_posix() for raw in a.delete]
     if len(set(deletes)) != len(deletes):
         raise SystemExit("Duplicate --delete path supplied.")
@@ -71,8 +79,41 @@ def main() -> int:
             mode = oct(src.stat().st_mode & 0o777)[2:].zfill(4)
             files.append({"path": rel_s, "sha256": sha256(dst), "mode": mode})
 
+        patch_dir = staging / "patches"
+        patch_dir.mkdir()
+        patch_names: set[str] = set()
+        for spec in a.patch:
+            if "=" not in spec:
+                raise SystemExit(
+                    f"Invalid --patch {spec!r}; expected PATCH=TARGET[,TARGET...]"
+                )
+            patch_raw, targets_raw = spec.split("=", 1)
+            patch_src = Path(patch_raw).expanduser().resolve()
+            if not patch_src.is_file():
+                raise SystemExit(f"Patch file not found: {patch_src}")
+            targets = [
+                safe_rel(item.strip()).as_posix()
+                for item in targets_raw.split(",")
+                if item.strip()
+            ]
+            if not targets:
+                raise SystemExit(f"Patch {patch_src} declares no targets")
+            if len(set(targets)) != len(targets):
+                raise SystemExit(f"Patch {patch_src} declares duplicate targets")
+            payload_name = patch_src.name
+            if payload_name in patch_names:
+                raise SystemExit(f"Duplicate patch payload name: {payload_name}")
+            patch_names.add(payload_name)
+            dst = patch_dir / payload_name
+            dst.write_bytes(patch_src.read_bytes())
+            patches.append({
+                "path": payload_name,
+                "sha256": sha256(dst),
+                "targets": targets,
+            })
+
         manifest = {
-            "format_version": 1,
+            "format_version": 2 if patches else 1,
             "project": "assistant-stack",
             "from_versions": [a.from_version],
             "to_version": a.to_version,
@@ -80,6 +121,7 @@ def main() -> int:
             "commit_message": f"Assistant update {a.to_version}",
             "files": files,
             "delete": deletes,
+            "patches": patches,
             "deploy": [],
         }
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -87,6 +129,8 @@ def main() -> int:
         with tarfile.open(a.output, "w:gz") as tf:
             tf.add(staging / "manifest.json", arcname="manifest.json")
             tf.add(staging / "files", arcname="files")
+            if patches:
+                tf.add(staging / "patches", arcname="patches")
     print(a.output)
     return 0
 
