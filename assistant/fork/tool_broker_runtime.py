@@ -223,3 +223,183 @@ def apply_sticky_tool_visibility(
         added=tuple(sorted(merged - before)),
         evidence=evidence,
     )
+
+# v0.2.3 broker shadow visibility
+@dataclass(frozen=True, slots=True)
+class BrokerVisibilityPreview:
+    """Behavior-free preview of the ToolBroker's proposed final visible set."""
+
+    tools: set[str]
+    added: tuple[str, ...]
+    removed: tuple[str, ...]
+    evidence: tuple[str, ...]
+    reasons: Mapping[str, str]
+
+
+# v0.2.3 typed cold-start capability recovery
+def _broker_capabilities_for_name(name: str) -> frozenset[str]:
+    """Return conservative typed capabilities for one concrete tool.
+
+    These capabilities classify tools, not user prose. They let the
+    controller's already-typed intent recover a permitted tool when semantic
+    retrieval misses it, without reintroducing keyword routing in the Broker.
+    """
+    caps = {f"tool:{name}"}
+
+    family = _TOOL_TO_FAMILY.get(name)
+    if family:
+        caps.add(f"family:{family}")
+
+    prefix = _mcp_server_prefix(name)
+    if prefix:
+        caps.add(f"mcp-server:{prefix}")
+
+    if "reminder" in name.lower():
+        caps.add("family:reminders")
+
+    return frozenset(caps)
+
+
+_BROKER_DOMAIN_CAPABILITIES: Mapping[str, frozenset[str]] = {
+    "notes_calendar_tasks": frozenset({
+        "family:calendar",
+        "family:notes_tasks",
+        "family:reminders",
+    }),
+    "email": frozenset({"family:email"}),
+    "contacts": frozenset({"family:contacts"}),
+    "cookbook": frozenset({"family:cookbook"}),
+    "sessions": frozenset({"family:sessions"}),
+    "integrations": frozenset({"family:integrations"}),
+}
+
+
+def broker_capabilities_for_domains(domains: Iterable[str]) -> tuple[str, ...]:
+    """Translate controller/router domains into typed Broker suggestions."""
+    caps: set[str] = set()
+    for domain in domains:
+        caps.update(_BROKER_DOMAIN_CAPABILITIES.get(str(domain), ()))
+    return tuple(sorted(caps))
+
+
+def preview_final_tool_visibility(
+    *,
+    current: set[str] | None,
+    messages: Sequence[Mapping[str, Any]],
+    disabled_tools: Iterable[str] = (),
+    mcp_mgr: Any = None,
+    forced_names: Iterable[str] = (),
+    suggested_capabilities: Iterable[str] = (),
+    max_visible: int | None = None,
+) -> BrokerVisibilityPreview:
+    """Compute the v0.2.3 Broker proposal without changing live visibility."""
+
+    from assistant.fork.tool_broker import (
+        ConversationToolState,
+        ToolBroker,
+        ToolDescriptor,
+    )
+    from src.tool_index import ALWAYS_AVAILABLE
+    from src.tool_policy import known_tool_names
+
+    disabled = {str(name) for name in disabled_tools if name}
+    connected_mcp = _connected_mcp_names(mcp_mgr)
+
+    permitted = set(known_tool_names())
+    permitted.update(connected_mcp)
+    permitted.difference_update(disabled)
+
+    current_set = set(current or ())
+    permitted.update(name for name in current_set if name not in disabled)
+
+    forced = {str(name) for name in forced_names if name}
+    permitted.update(name for name in forced if name not in disabled)
+
+    if not permitted:
+        return BrokerVisibilityPreview(
+            tools=set(),
+            added=(),
+            removed=tuple(sorted(current_set)),
+            evidence=(),
+            reasons={},
+        )
+
+    descriptors = [
+        ToolDescriptor(
+            name=name,
+            capabilities=_broker_capabilities_for_name(name),
+            core_visible=name in ALWAYS_AVAILABLE,
+            source="mcp" if name.startswith("mcp__") else "builtin",
+        )
+        for name in sorted(permitted)
+    ]
+
+    state = ConversationToolState()
+    evidence = recent_authoritative_tool_names(messages)
+    for name in evidence:
+        state.activate(*_broker_capabilities_for_name(name))
+
+    suggested = {str(cap) for cap in suggested_capabilities if cap}
+
+    semantic_scores = {
+        name: 1.0
+        for name in current_set
+        if name in permitted
+    }
+
+    # v0.2.3 preserve-candidates shadow tuning
+    # The first production finalizer must not silently drop legacy-selected
+    # candidates merely to hit an arbitrary prompt-size target. Preserve every
+    # current candidate plus core/forced/authoritative-sticky recovery tools.
+    # Prompt-budget ranking can become a separate, measured migration later.
+    sticky_preview, _ = sticky_tools_from_history(messages, mcp_mgr=mcp_mgr)
+    sticky_preview.difference_update(disabled)
+
+    suggested_names = {
+        descriptor.name
+        for descriptor in descriptors
+        if descriptor.capabilities & suggested
+    }
+
+    candidate_names = (
+        current_set
+        | forced
+        | set(ALWAYS_AVAILABLE)
+        | sticky_preview
+        | suggested_names
+    )
+    candidate_names.intersection_update(permitted)
+    selection_limit = (
+        int(max_visible)
+        if max_visible is not None
+        else max(1, len(candidate_names))
+    )
+
+    broker = ToolBroker(descriptors, max_visible=selection_limit)
+    selection = broker.select(
+        permitted_names=permitted,
+        state=state,
+        suggested_capabilities=tuple(sorted(suggested)),
+        semantic_scores=semantic_scores,
+        forced_names=tuple(sorted(forced)),
+    )
+    proposed = set(selection.visible)
+
+    return BrokerVisibilityPreview(
+        tools=proposed,
+        added=tuple(sorted(proposed - current_set)),
+        removed=tuple(sorted(current_set - proposed)),
+        evidence=evidence,
+        reasons=dict(selection.reasons),
+    )
+
+# v0.2.3 model-adapter visibility restriction
+def restrict_tool_visibility(
+    current: set[str] | None,
+    supported: Iterable[str],
+) -> set[str] | None:
+    """Allow a model adapter to REMOVE Broker-visible tools, never add them."""
+    if current is None:
+        return None
+    return set(current) & {str(name) for name in supported if name}
+

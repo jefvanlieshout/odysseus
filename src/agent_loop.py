@@ -4100,6 +4100,43 @@ async def stream_agent_loop(
         except Exception as _e:
             logger.debug(f"[tool-rag] skill-aware tool include skipped: {_e}")
 
+    # v0.2.3 broker shadow visibility
+    # The old selector still drives live behavior for now. ToolBroker computes
+    # the set it would expose after RAG/keywords/domains/skills/sticky state,
+    # and we log differences before making it authoritative.
+    if not guide_only and _relevant_tools is not None:
+        try:
+            from assistant.fork.tool_broker_runtime import preview_final_tool_visibility
+            from assistant.fork.tool_broker_runtime import broker_capabilities_for_domains
+            _broker_suggested_capabilities = broker_capabilities_for_domains(
+                _intent.get("domains") or set()
+            )
+            _broker_preview = preview_final_tool_visibility(
+                current=_relevant_tools,
+                messages=messages,
+                disabled_tools=disabled_tools,
+                mcp_mgr=mcp_mgr,
+                forced_names=forced_tools or set(),
+                suggested_capabilities=_broker_suggested_capabilities,
+            )
+            logger.info(
+                "[tool-broker] final current=%s selected=%s added=%s removed=%s "
+                "evidence=%s reasons=%s",
+                sorted(_relevant_tools),
+                sorted(_broker_preview.tools),
+                list(_broker_preview.added),
+                list(_broker_preview.removed),
+                list(_broker_preview.evidence),
+                dict(_broker_preview.reasons),
+            )
+            # v0.2.3 broker final visibility active
+            _relevant_tools = set(_broker_preview.tools)
+        except Exception as _e:
+            logger.warning(
+                "[tool-broker] shadow visibility failed; live selector unchanged: %s",
+                _e,
+            )
+
     _intent_domains = set(_intent.get("domains") or set())
     _base_relevant_tools = None if _relevant_tools is None else set(_relevant_tools)
     _runtime_skill_tools: Set[str] = set()
@@ -4157,19 +4194,32 @@ async def stream_agent_loop(
             general_no_tool_mode,
         ) = _route_finetune_modes(candidate_model)
         if doc_mode and route_tools is not None:
+            from assistant.fork.tool_broker_runtime import restrict_tool_visibility
             if _prompt_active_document is not None:
-                route_tools = {
-                    "edit_document", "update_document", "suggest_document",
-                    "ask_user", "update_plan",
-                }
+                route_tools = restrict_tool_visibility(
+                    route_tools,
+                    {
+                        "edit_document", "update_document", "suggest_document",
+                        "ask_user", "update_plan",
+                    },
+                )
             else:
-                route_tools = {"create_document", "ask_user", "update_plan"}
+                route_tools = restrict_tool_visibility(
+                    route_tools,
+                    {"create_document", "ask_user", "update_plan"},
+                )
         elif notes_mode and route_tools is not None:
-            route_tools = {
-                "manage_notes", "manage_calendar", "manage_tasks",
-                "ask_user", "update_plan",
-            }
+            from assistant.fork.tool_broker_runtime import restrict_tool_visibility
+            route_tools = restrict_tool_visibility(
+                route_tools,
+                {
+                    "manage_notes", "manage_calendar", "manage_tasks",
+                    "ask_user", "update_plan",
+                },
+            )
         elif general_no_tool_mode:
+            # This finetune intentionally supports no general tools. Emptying
+            # the Broker-approved set is a restriction, never an expansion.
             route_tools = set()
         return route_tools
 
