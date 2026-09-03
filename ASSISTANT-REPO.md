@@ -58,3 +58,7 @@ Real `.env` files, SQLite databases, logs, caches, Brain data and private-key fo
 ## Upstream Odysseus
 
 Do not blindly pull an upstream development branch into `assistant-main`. Treat upstream changes as code changes that should be inspected/merged and tested against the Brain/assistant integration.
+
+## Notification policy (v0.1.3)
+
+Notifications use state-aware duplicate suppression rather than a blanket time cooldown. Persistent reminders may be unconditional or tied to an active condition fingerprint.

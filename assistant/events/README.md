@@ -1,13 +1,11 @@
 # Assistant Events
 
-Python-authoritative event storage + notification delivery for the assistant stack.
+Python-authoritative event storage, state-aware notification delivery, and reminders.
 
-## Why it exists
-
-Event producers report facts to one service instead of speaking Telegram directly:
+## Event path
 
 ```text
-Proxmox / calendar / email / future agents
+verified producer (later: Proxmox / calendar / email)
                   |
                   v
           assistant-events
@@ -19,80 +17,49 @@ Proxmox / calendar / email / future agents
                      Telegram
 ```
 
-Qwen is not the source of truth for system events. A real connector/controller captures the fact first; the model may later summarize or reason about that captured data.
+Qwen is not the source of truth for system events. A connector/controller captures a real fact first. Qwen may later explain it or request a reminder through a validated tool.
 
-## Start
+## State-aware anti-spam
 
-From the repository root:
+There is no blanket time cooldown anymore.
+
+- first/new condition -> notify
+- unchanged repeated condition -> store, suppress duplicate notification
+- severity increase -> notify
+- producer-supplied `notification_key` changes -> notify
+- recovery from an active condition -> notify
+- every occurrence is still stored in SQLite
+
+`fingerprint` identifies the underlying condition. `notification_key` identifies a meaningful sub-state of that condition. Dynamic metrics/duration should go in message/metadata without changing the key.
+
+## Reminders
+
+Reminders are persistent in SQLite. They can be unconditional or tied to an active condition fingerprint.
+
+A conditional reminder fires only when that condition is still `active` when it becomes due. If the monitor has already reported recovery, the reminder is skipped.
+
+The API accepts either `delay_seconds` or an absolute ISO-8601 `due_at`. This is intentionally ready for a Qwen tool later: Qwen interprets natural language, Python validates and persists the concrete schedule.
+
+## Start / test
 
 ```bash
 ./events.sh start
-```
-
-On first start, `events.sh` creates `assistant/events/.env` with a random `EVENTS_API_KEY`. The real `.env` stays outside Git.
-
-The service reuses `TELEGRAM_BOT_TOKEN` from `assistant/telegram/.env`; the token is not copied into another file. If exactly one Telegram user is allowlisted, that user's ID is also used as the private Telegram chat ID. For groups or multiple allowlisted users, set `TELEGRAM_CHAT_ID` explicitly in `assistant/events/.env`.
-
-The human-facing assistant name comes from `assistant/config/identity.toml`, not from a hard-coded service name.
-
-## Test
-
-```bash
 ./events.sh test
-```
-
-That creates a real event and should send a Telegram message similar to:
-
-```text
-ℹ️ Jarvis · INFO · INFO
-
-Outbound notifications are working
-Hello Jef. The event system delivered this without asking Qwen to do anything.
-
-Source: manual-test · Target: telegram · Agent: main
-```
-
-## Useful commands
-
-```bash
-./events.sh status
-./events.sh logs
-./events.sh stop
+./events.sh test       # repeat: stored, but Telegram should stay quiet
+./events.sh remind 10 "This is a ten-second reminder test"
+./events.sh reminders
 ```
 
 ## API
 
-The service binds to localhost only:
+Localhost only: `http://127.0.0.1:8780`
 
-```text
-http://127.0.0.1:8780
-```
+Authenticated endpoints require `Authorization: Bearer <EVENTS_API_KEY>`.
 
-`GET /health` is unauthenticated and localhost-bound. Event/history endpoints require:
+- `POST /events`
+- `GET /events`
+- `POST /reminders`
+- `GET /reminders`
+- `POST /reminders/{id}/cancel`
 
-```text
-Authorization: Bearer <EVENTS_API_KEY>
-```
-
-### Minimal event
-
-```json
-{
-  "source": "proxmox",
-  "event_type": "guest_down",
-  "title": "Guest is down",
-  "message": "VM 104 is stopped."
-}
-```
-
-Optional future-agent provenance is already supported:
-
-```json
-{
-  "actor_id": "proxmox-monitor",
-  "agent_id": "homelab",
-  "correlation_id": "diagnostic-run-123"
-}
-```
-
-`agent_id` is metadata only. It grants no permissions.
+`agent_id` is provenance only; it grants zero permissions.
