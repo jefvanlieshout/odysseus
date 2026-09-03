@@ -185,20 +185,68 @@ def validate_staged(repo: Path) -> None:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        if "-----BEGIN PRIVATE KEY-----" in text or "-----BEGIN OPENSSH PRIVATE KEY-----" in text:
+        private_key_marker = "-----BEGIN " + "PRIVATE KEY-----"
+        openssh_key_marker = "-----BEGIN OPENSSH " + "PRIVATE KEY-----"
+        if private_key_marker in text or openssh_key_marker in text:
             git(repo, "reset", check=False)
             raise RuntimeError(f"Refusing to commit a private key found in {rel}")
 
 
+def untracked_paths(repo: Path) -> list[Path]:
+    out = git(repo, "ls-files", "--others", "--exclude-standard", "-z", capture=True).stdout
+    return [Path(p) for p in out.split("\0") if p]
+
+
+def is_tracked(repo: Path, rel: Path) -> bool:
+    return git(
+        repo, "ls-files", "--error-unmatch", "--", rel.as_posix(),
+        capture=True, check=False,
+    ).returncode == 0
+
+
+def refuse_prestaged_new_files(repo: Path) -> None:
+    out = git(
+        repo, "diff", "--cached", "--name-only", "--diff-filter=A", "-z",
+        capture=True,
+    ).stdout
+    added = [Path(p) for p in out.split("\0") if p]
+    if added:
+        listing = "\n  - ".join(str(p) for p in added)
+        raise RuntimeError(
+            "Refusing to auto-commit newly staged files that were not created by this update. "
+            "Commit or unstage them first:\n  - " + listing
+        )
+
+
 def backup_dirty_tree(repo: Path, target_version: str) -> None:
-    status = git(repo, "status", "--porcelain=v1", capture=True).stdout
-    if not status.strip():
-        return
-    print("Working tree has changes; saving them as a local Git backup commit...")
-    git(repo, "add", "-A")
+    # Preserve edits to already-versioned source files, but never adopt arbitrary
+    # untracked files into Git merely because an update is being installed.
+    refuse_prestaged_new_files(repo)
+    git(repo, "add", "-u")
     validate_staged(repo)
     if staged_paths(repo):
+        print("Tracked working-tree changes found; saving them as a local Git backup commit...")
         commit(repo, f"Local backup before assistant update {target_version}")
+
+    untracked = untracked_paths(repo)
+    if untracked:
+        print(f"Leaving {len(untracked)} unrelated untracked file(s) untouched.")
+
+
+def ensure_update_path_safe(repo: Path, rel: Path) -> None:
+    dst = repo / rel
+    if dst.exists() and not is_tracked(repo, rel):
+        raise RuntimeError(
+            f"Update would overwrite an untracked local file: {rel}. "
+            "Move, commit, or remove it first."
+        )
+
+
+def stage_update_paths(repo: Path, touched: list[Path]) -> None:
+    # Stage exactly what the verified manifest touched, never the whole tree.
+    unique = sorted({p.as_posix() for p in touched})
+    if unique:
+        git(repo, "add", "-A", "--", *unique)
 
 
 def make_pre_tag(repo: Path, version: str) -> str:
@@ -223,9 +271,19 @@ def copy_atomic(src: Path, dst: Path, mode: int | None) -> None:
 
 
 def syntax_checks(repo: Path, touched: list[Path]) -> None:
-    py_files = [str(repo / p) for p in touched if p.suffix == ".py" and (repo / p).exists()]
-    for path in py_files:
-        run([sys.executable, "-m", "py_compile", path])
+    # Compile Python source in memory so validation never creates __pycache__.
+    # Extensionless executable Python tools are recognized by their shebang.
+    for rel in touched:
+        path = repo / rel
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            source = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        is_python = path.suffix == ".py" or source.startswith("#!/usr/bin/env python3")
+        if is_python:
+            compile(source, str(path), "exec")
 
     for rel in touched:
         path = repo / rel
@@ -322,6 +380,7 @@ def main() -> int:
 
             try:
                 for rel, src, mode in verified:
+                    ensure_update_path_safe(repo, rel)
                     dst = repo / rel
                     existing[rel] = dst.exists()
                     if dst.exists() and dst.is_file():
@@ -333,6 +392,7 @@ def main() -> int:
 
                 for raw in manifest.get("delete", []):
                     rel = safe_rel(str(raw))
+                    ensure_update_path_safe(repo, rel)
                     dst = repo / rel
                     existing[rel] = dst.exists()
                     if dst.exists():
@@ -348,7 +408,7 @@ def main() -> int:
                 touched.append(Path(VERSION_FILE))
                 syntax_checks(repo, touched)
 
-                git(repo, "add", "-A")
+                stage_update_paths(repo, touched)
                 validate_staged(repo)
                 commit(repo, manifest.get("commit_message") or f"Assistant update {target_version}")
                 version_tag = f"assistant-v{target_version}"

@@ -26,9 +26,25 @@ if [[ "${2:-}" != "--yes" ]]; then
   read -r -p "Type ROLLBACK to continue: " answer
   [[ "$answer" == "ROLLBACK" ]] || { echo "Cancelled."; exit 1; }
 fi
-if [[ -n "$(git status --porcelain)" ]]; then
-  git add -A
-  git -c user.name="Assistant Updater" -c user.email="assistant-updater@local" commit -m "Local backup before rollback" || true
+
+pre_staged_new="$(git diff --cached --name-only --diff-filter=A)"
+if [[ -n "$pre_staged_new" ]]; then
+  echo "Refusing to auto-commit newly staged files before rollback." >&2
+  echo "Commit or unstage these first:" >&2
+  printf '%s\n' "$pre_staged_new" >&2
+  exit 1
 fi
+
+git add -u
+if ! git diff --cached --quiet; then
+  git -c user.name="Assistant Updater" -c user.email="assistant-updater@local" \
+    commit -m "Local backup before rollback"
+fi
+
+untracked_count="$(git ls-files --others --exclude-standard | wc -l)"
+if [[ "$untracked_count" -gt 0 ]]; then
+  echo "Leaving $untracked_count unrelated untracked file(s) untouched."
+fi
+
 git reset --hard "$TARGET"
 echo "Rolled back code to $TARGET. Rebuild/restart affected services as appropriate."
