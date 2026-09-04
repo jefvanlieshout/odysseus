@@ -3,9 +3,16 @@ from __future__ import annotations
 import json
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from jarvis_brain.worker_daemon import WorkerDaemonConfig, _result_payload
+from jarvis_brain.worker_daemon import (
+    WorkerDaemonConfig,
+    _default_ready_url,
+    _model_id_matches,
+    _probe_llm,
+    _result_payload,
+    run_daemon,
+)
 
 
 class _Action:
@@ -38,6 +45,9 @@ class WorkerDaemonTests(unittest.TestCase):
             "BRAIN_LLM_MAX_TOKENS",
             "BRAIN_LLM_TEMPERATURE",
             "BRAIN_LLM_REASONING_EFFORT",
+            "BRAIN_LLM_READY_URL",
+            "BRAIN_LLM_READY_TIMEOUT_SECONDS",
+            "BRAIN_LLM_UNAVAILABLE_POLL_SECONDS",
             "BRAIN_WORKER_POLL_SECONDS",
             "BRAIN_WORKER_ERROR_BACKOFF_SECONDS",
             "BRAIN_WORKER_LEASE_SECONDS",
@@ -57,6 +67,9 @@ class WorkerDaemonTests(unittest.TestCase):
         self.assertEqual(config.poll_seconds, 2.0)
         self.assertEqual(config.llm_headers, {})
         self.assertEqual(config.llm_reasoning_effort, "medium")
+        self.assertEqual(config.llm_ready_url, "http://127.0.0.1:8000/v1/models")
+        self.assertEqual(config.llm_ready_timeout_seconds, 2.0)
+        self.assertEqual(config.llm_unavailable_poll_seconds, 10.0)
 
     def test_headers_are_parsed_without_changing_types_at_call_boundary(self):
         with patch.dict(
@@ -89,6 +102,59 @@ class WorkerDaemonTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 WorkerDaemonConfig.from_env()
+
+    def test_ready_url_is_derived_from_chat_route(self):
+        self.assertEqual(
+            _default_ready_url("http://127.0.0.1:8000/v1/chat/completions"),
+            "http://127.0.0.1:8000/v1/models",
+        )
+
+    def test_model_match_accepts_same_basename_only(self):
+        self.assertTrue(_model_id_matches("Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B"))
+        self.assertTrue(_model_id_matches("Qwen/Qwen3.8-27B", "Qwen3.8-27B"))
+        self.assertFalse(_model_id_matches("Qwen/Qwen3.8-27B", "other/model"))
+
+    def test_probe_llm_requires_expected_model(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, limit):
+                return json.dumps({
+                    "data": [{"id": "Qwen/Qwen3.8-27B"}]
+                }).encode()
+
+        config = WorkerDaemonConfig.from_env()
+        with patch("jarvis_brain.worker_daemon.urlopen", return_value=Response()):
+            ready, detail = _probe_llm(config)
+        self.assertTrue(ready)
+        self.assertEqual(detail, "ready")
+
+        class Wrong(Response):
+            def read(self, limit):
+                return json.dumps({"data": [{"id": "other/model"}]}).encode()
+
+        with patch("jarvis_brain.worker_daemon.urlopen", return_value=Wrong()):
+            ready, detail = _probe_llm(config)
+        self.assertFalse(ready)
+        self.assertIn("expected model not served", detail)
+
+    def test_unavailable_llm_does_not_claim_or_mutate_a_job(self):
+        config = WorkerDaemonConfig.from_env()
+        fake_worker = Mock()
+        with (
+            patch("jarvis_brain.worker_daemon.build_worker", return_value=fake_worker),
+            patch("jarvis_brain.worker_daemon._probe_llm", return_value=(False, "connection refused")),
+        ):
+            rc = run_daemon(config, once=True)
+
+        self.assertEqual(rc, 2)
+        fake_worker.run_once.assert_not_called()
 
     def test_result_logging_keeps_python_owned_action(self):
         payload = _result_payload(_Result())

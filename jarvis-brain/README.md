@@ -112,6 +112,10 @@ continuous semantic worker in `jarvis-brain-semantic-worker`.
 - semantic commit idempotency protects partial-plan replay;
 - model/transport/structured-output failures retry the entire job and are never
   disguised as semantic candidate rejection;
+- the daemon probes the configured `/v1/models` route before claiming work, so
+  model-server downtime never consumes semantic job attempts;
+- `brain-autonomous-start.sh` owns only Brain containers and deliberately refuses
+  to rebuild/recreate Odysseus or Chroma;
 - safe reasoner diagnostics record finish reason and token/field lengths without
   storing prompts or private reasoning text.
 
