@@ -185,6 +185,43 @@ class ReasonerTests(unittest.TestCase):
         self.assertEqual(result.relation, SemanticRelation.STATE_CHANGE)
         self.assertEqual(result.target_memory_uuid, target)
 
+    def test_relation_prompt_preserves_explicit_extension_details(self):
+        target = "11111111-1111-4111-8111-111111111111"
+        self.reply({
+            "relation": "EXTENSION",
+            "target_memory_uuid": target,
+            "confidence": 0.95,
+            "explanation": "explicit qualifier adds durable detail",
+        })
+
+        self.reasoner.classify_relation(
+            candidate=SemanticCandidate(
+                "Prefers Docker Compose for small local tests when there are only a handful of services.",
+                "preference",
+                "deployment",
+                0.95,
+                "e",
+                "handful of services",
+            ),
+            neighbors=(
+                SearchHit(
+                    "semantic",
+                    target,
+                    "Prefers Docker Compose for small local test deployments.",
+                    1.0,
+                    {},
+                ),
+            ),
+        )
+
+        body = self.server.requests[-1]["body"]
+        system = body["messages"][0]["content"]
+        self.assertIn("MATCH requires", system)
+        self.assertIn("adds at least one explicit durable detail", system)
+        self.assertIn("Do NOT collapse an explicit user-stated detail into MATCH", system)
+        self.assertIn("merely because it seems implied", system)
+        self.assertIn("explicit temporal replacement -> STATE_CHANGE", system)
+
     def test_consolidation_keep_sentinel_maps_to_none(self):
         self.reply({
             "content": "The user currently uses zsh.",
