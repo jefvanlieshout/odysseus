@@ -306,12 +306,18 @@ class OpenAIJsonReasoner:
             operation="candidate_proposals",
             schema=CANDIDATE_SCHEMA,
             system=(
-                "You extract durable user memory candidates from one authoritative user message. "
-                "Only propose information that is useful beyond the immediate turn: stable preferences, "
-                "facts, projects, constraints, or relationships. Do NOT save greetings, questions, commands, "
-                "temporary feelings/health states, conversational filler, or assistant-generated claims. "
+                "You extract durable SEMANTIC user memory candidates from one authoritative user message. "
+                "A semantic memory should normally remain useful and true across many future conversations. "
+                "Good candidates include stable preferences, durable facts, long-lived project goals or architecture "
+                "decisions, constraints, and relationships. "
+                "Do NOT save greetings, questions, commands, conversational filler, temporary feelings/health states, "
+                "or transient operational/project status such as something currently running, stopped, fixed, broken, "
+                "being tested, deployed, or 'finally working'. Those are episodic observations unless the message "
+                "also explicitly states a durable goal, architecture decision, preference, constraint, or ownership fact. "
+                "Do not infer a durable project identity or user ownership merely because a named system/component appears "
+                "inside a transient status remark. "
                 "Every evidence_quote MUST be an exact contiguous substring copied from EVIDENCE. "
-                "If there is no durable memory, return an empty candidates array. Never invent details."
+                "If there is no durable semantic memory, return an empty candidates array. Never invent details."
             ),
             user=(
                 f"OWNER_ID: {owner_id}\nEVIDENCE_UUID: {evidence_uuid}\n"

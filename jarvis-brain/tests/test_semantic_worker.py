@@ -165,6 +165,72 @@ class SemanticWorkerTests(unittest.TestCase):
         self.assertNotEqual(first["lease_token"], second["lease_token"])
         self.assertEqual(second["attempt_count"], 2)
 
+    def test_retry_backoff_blocks_newer_job_for_same_owner(self):
+        first = self.capture("first", owner="jef")
+        second = self.capture("second", owner="jef")
+
+        lease = self.brain.claim_semantic_job(worker_id="a", lease_seconds=60)
+        self.assertEqual(lease["job_uuid"], first["job_uuid"])
+        status = self.brain.retry_semantic_job(
+            job_uuid=lease["job_uuid"],
+            lease_token=lease["lease_token"],
+            error="temporary model failure",
+            max_attempts=5,
+        )
+        self.assertEqual(status, "retry")
+
+        # The older retry is backing off, so the newer job must NOT leapfrog it.
+        blocked = self.brain.claim_semantic_job(worker_id="b", lease_seconds=60)
+        self.assertIsNone(blocked)
+
+        with self.brain.store.write() as db:
+            db.execute(
+                "UPDATE semantic_jobs SET next_attempt_at='2000-01-01T00:00:00+00:00' "
+                "WHERE uuid=?",
+                (first["job_uuid"],),
+            )
+
+        retry_lease = self.brain.claim_semantic_job(worker_id="c", lease_seconds=60)
+        self.assertEqual(retry_lease["job_uuid"], first["job_uuid"])
+        self.brain.complete_semantic_job(
+            job_uuid=retry_lease["job_uuid"],
+            lease_token=retry_lease["lease_token"],
+            result_json='{"committed":[],"rejections":[]}',
+        )
+
+        next_lease = self.brain.claim_semantic_job(worker_id="d", lease_seconds=60)
+        self.assertEqual(next_lease["job_uuid"], second["job_uuid"])
+
+    def test_retry_backoff_only_blocks_same_owner(self):
+        first = self.capture("first", owner="jef")
+        other = self.capture("other", owner="alice")
+
+        lease = self.brain.claim_semantic_job(worker_id="a", lease_seconds=60)
+        self.assertEqual(lease["job_uuid"], first["job_uuid"])
+        self.brain.retry_semantic_job(
+            job_uuid=lease["job_uuid"],
+            lease_token=lease["lease_token"],
+            error="temporary model failure",
+            max_attempts=5,
+        )
+
+        # Alice is independent and should not be head-of-line blocked by Jef.
+        other_lease = self.brain.claim_semantic_job(worker_id="b", lease_seconds=60)
+        self.assertEqual(other_lease["job_uuid"], other["job_uuid"])
+
+    def test_active_processing_job_blocks_newer_same_owner(self):
+        first = self.capture("first", owner="jef")
+        self.capture("second", owner="jef")
+
+        lease = self.brain.claim_semantic_job(worker_id="a", lease_seconds=60)
+        self.assertEqual(lease["job_uuid"], first["job_uuid"])
+
+        # Active lease on the owner's head job prevents a second worker from
+        # processing a newer semantic event out of order.
+        self.assertIsNone(
+            self.brain.claim_semantic_job(worker_id="b", lease_seconds=60)
+        )
+
     def test_wrong_lease_cannot_read_save_or_complete_job(self):
         self.capture()
         lease = self.brain.claim_semantic_job(worker_id="a", lease_seconds=60)

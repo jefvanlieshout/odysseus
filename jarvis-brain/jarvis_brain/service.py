@@ -437,6 +437,15 @@ class BrainMemoryService:
                 "  (j.status='processing' AND j.lease_expires_at IS NOT NULL "
                 "   AND j.lease_expires_at<=?)"
                 ") "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM semantic_jobs older "
+                "  WHERE older.owner_id=j.owner_id "
+                "    AND older.status IN ('pending','retry','processing') "
+                "    AND ("
+                "      older.created_at < j.created_at "
+                "      OR (older.created_at=j.created_at AND older.id < j.id)"
+                "    )"
+                ") "
                 "ORDER BY j.created_at, j.id LIMIT 1",
                 (now, now),
             ).fetchone()

@@ -250,6 +250,27 @@ class ReasonerTests(unittest.TestCase):
                 reasoning_effort="high",
             ))
 
+    def test_candidate_prompt_distinguishes_semantic_memory_from_runtime_status(self):
+        content = json.dumps({"candidates": []})
+        raw = json.dumps({
+            "choices": [{"message": {"content": content}}]
+        }).encode()
+        self.server.replies.append((200, raw))
+
+        self.reasoner.propose_candidates(
+            evidence_text="Nice, the autonomous Brain worker is finally running",
+            evidence_uuid="e",
+            owner_id="j",
+        )
+
+        body = self.server.requests[-1]["body"]
+        system = body["messages"][0]["content"]
+        self.assertIn("durable SEMANTIC", system)
+        self.assertIn("transient operational/project status", system)
+        self.assertIn("currently running", system)
+        self.assertIn("finally working", system)
+        self.assertIn("episodic observations", system)
+
     def test_config_rejects_credentials_in_url(self):
         with self.assertRaises(StructuredReasonerError):
             OpenAIJsonReasoner(StructuredReasonerConfig(
