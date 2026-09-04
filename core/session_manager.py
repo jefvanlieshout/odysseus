@@ -243,6 +243,9 @@ class SessionManager:
 
     def _persist_message(self, session_id: str, message: ChatMessage):
         """Persist a single message to the database."""
+        # Brain shadow mirroring is populated only after the native commit
+        # succeeds, then delivered after this DB session is closed.
+        brain_shadow_payload = None
         db = SessionLocal()
         try:
             db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
@@ -300,6 +303,20 @@ class SessionManager:
             # Store DB ID on the in-memory message for edit/delete by ID
             message.metadata['_db_id'] = msg_id
 
+            # Mirror the exact authoritative persisted representation.  The DB
+            # UUID is the idempotency identity used by Brain; user messages go
+            # through Brain's observation endpoint while assistant/system/tool
+            # messages remain transcript-only.
+            brain_shadow_payload = {
+                "owner": getattr(db_session, "owner", None),
+                "session_id": session_id,
+                "message_id": msg_id,
+                "role": message.role,
+                "content": _content,
+                "occurred_at": message.metadata.get("timestamp"),
+                "metadata": dict(message.metadata or {}),
+            }
+
             logger.debug(f"Persisted message to session {session_id}")
 
         except Exception as e:
@@ -307,6 +324,19 @@ class SessionManager:
             db.rollback()
         finally:
             db.close()
+
+        # Shadow mode is strictly post-commit and non-authoritative.  A Brain
+        # outage, timeout, conflict, or bug cannot roll back native Odysseus
+        # history or change the response path.
+        if brain_shadow_payload is not None:
+            try:
+                from assistant.fork.brain_adapter import shadow_persisted_message
+                shadow_persisted_message(**brain_shadow_payload)
+            except Exception:
+                logger.warning(
+                    "[brain-shadow] unexpected adapter failure after native message commit",
+                    exc_info=True,
+                )
 
     def truncate_messages(self, session_id: str, keep_count: int) -> bool:
         """Truncate session history, keeping only the first `keep_count` messages."""

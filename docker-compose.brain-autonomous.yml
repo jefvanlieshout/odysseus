@@ -1,0 +1,85 @@
+services:
+  odysseus:
+    environment:
+      ASSISTANT_BRAIN_MODE: shadow
+      JARVIS_BRAIN_URL: http://jarvis-brain:8765
+      JARVIS_BRAIN_API_KEY: ${JARVIS_BRAIN_API_KEY}
+      ASSISTANT_BRAIN_TIMEOUT_SECONDS: "0.75"
+      ASSISTANT_BRAIN_DEFAULT_OWNER: local
+    volumes:
+      - ./src:/app/src:ro,z
+      - ./assistant:/app/assistant:ro,z
+      - ./routes:/app/routes:ro,z
+      - ./core:/app/core:ro,z
+    depends_on:
+      jarvis-brain:
+        condition: service_started
+
+  jarvis-brain:
+    container_name: jarvis-brain-shadow
+    build:
+      context: ./jarvis-brain
+      dockerfile: Dockerfile
+    environment:
+      JARVIS_BRAIN_API_KEY: ${JARVIS_BRAIN_API_KEY}
+      BRAIN_DB_PATH: /data/brain.db
+      BRAIN_HOST: 0.0.0.0
+      BRAIN_PORT: "8765"
+      BRAIN_VECTOR_BACKEND: chroma
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      BRAIN_EMBED_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      BRAIN_EMBED_CACHE: /data/fastembed-cache
+      BRAIN_CHROMA_SEMANTIC_COLLECTION: jarvis_brain_shadow_semantic_v1
+      BRAIN_CHROMA_EPISODIC_COLLECTION: jarvis_brain_shadow_episodic_v1
+    volumes:
+      - jarvis-brain-shadow-data:/data
+    restart: unless-stopped
+    depends_on:
+      - chromadb
+    networks:
+      - default
+
+  jarvis-brain-worker:
+    container_name: jarvis-brain-semantic-worker
+    build:
+      context: ./jarvis-brain
+      dockerfile: Dockerfile
+    command: ["python", "-m", "jarvis_brain.worker_daemon"]
+    environment:
+      BRAIN_DB_PATH: /data/brain.db
+      BRAIN_VECTOR_BACKEND: chroma
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      BRAIN_EMBED_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      BRAIN_EMBED_CACHE: /data/fastembed-cache
+      BRAIN_CHROMA_SEMANTIC_COLLECTION: jarvis_brain_shadow_semantic_v1
+      BRAIN_CHROMA_EPISODIC_COLLECTION: jarvis_brain_shadow_episodic_v1
+
+      # Brain's analyzer is intentionally independent from Gwen's current chat model.
+      # The worker shares Odysseus' network namespace so 127.0.0.1 reaches the
+      # same local OpenAI-compatible endpoint proven by the live CREATE/MATCH gates.
+      BRAIN_LLM_URL: ${BRAIN_LLM_URL:-http://127.0.0.1:8000/v1/chat/completions}
+      BRAIN_LLM_MODEL: ${BRAIN_LLM_MODEL:-Qwen/Qwen3.8-27B}
+      BRAIN_LLM_TIMEOUT_SECONDS: ${BRAIN_LLM_TIMEOUT_SECONDS:-120}
+      BRAIN_LLM_MAX_TOKENS: ${BRAIN_LLM_MAX_TOKENS:-900}
+      BRAIN_LLM_TEMPERATURE: ${BRAIN_LLM_TEMPERATURE:-0}
+
+      BRAIN_WORKER_POLL_SECONDS: ${BRAIN_WORKER_POLL_SECONDS:-2}
+      BRAIN_WORKER_ERROR_BACKOFF_SECONDS: ${BRAIN_WORKER_ERROR_BACKOFF_SECONDS:-5}
+      BRAIN_WORKER_LEASE_SECONDS: ${BRAIN_WORKER_LEASE_SECONDS:-300}
+      BRAIN_WORKER_MAX_CONSECUTIVE_JOBS: ${BRAIN_WORKER_MAX_CONSECUTIVE_JOBS:-8}
+    volumes:
+      - jarvis-brain-shadow-data:/data
+    network_mode: "service:odysseus"
+    restart: unless-stopped
+    depends_on:
+      odysseus:
+        condition: service_started
+      jarvis-brain:
+        condition: service_started
+      chromadb:
+        condition: service_started
+
+volumes:
+  jarvis-brain-shadow-data:

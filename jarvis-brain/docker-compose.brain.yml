@@ -1,0 +1,27 @@
+services:
+  jarvis-brain:
+    build:
+      context: ./jarvis-brain
+      dockerfile: Dockerfile
+    environment:
+      - JARVIS_BRAIN_API_KEY=${JARVIS_BRAIN_API_KEY:?JARVIS_BRAIN_API_KEY must be set}
+      - BRAIN_DB_PATH=/data/brain.db
+      - BRAIN_HOST=0.0.0.0
+      - BRAIN_PORT=8765
+      - BRAIN_VECTOR_BACKEND=chroma
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - BRAIN_EMBED_MODEL=${BRAIN_EMBED_MODEL:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
+      - BRAIN_EMBED_CACHE=/data/fastembed-cache
+    volumes:
+      - jarvis-brain-data:/data
+    ports:
+      - "127.0.0.1:8765:8765"
+    restart: unless-stopped
+    depends_on:
+      - chromadb
+    networks:
+      - default
+
+volumes:
+  jarvis-brain-data:
