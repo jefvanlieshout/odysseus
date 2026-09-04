@@ -352,6 +352,31 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
       delete                  — line 2: memory_id
       search                  — line 2: query
     """
+    # `memory_enabled` is the master switch for the legacy/native memory
+    # system. Brain capture/recall have their own independent gates. Keeping
+    # this check at the tool implementation boundary prevents a model from
+    # bypassing the native-memory toggle by calling manage_memory directly.
+    try:
+        from routes.prefs_routes import _load_for_user as _load_memory_prefs
+        if not _load_memory_prefs(owner).get("memory_enabled", True):
+            return {
+                "error": (
+                    "Native Odysseus memory is disabled for this user. "
+                    "No native memory operation was performed."
+                )
+            }
+    except Exception:
+        logger.warning(
+            "Could not verify native memory preference; blocking manage_memory",
+            exc_info=True,
+        )
+        return {
+            "error": (
+                "Could not verify the native memory preference; "
+                "no memory operation was performed."
+            )
+        }
+
     if not _memory_manager:
         return {"error": "Memory manager not available"}
 

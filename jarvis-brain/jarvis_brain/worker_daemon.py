@@ -257,6 +257,11 @@ def _result_payload(result: Any) -> dict[str, Any]:
     }
 
 
+def _job_needs_retry_backoff(payload: dict[str, Any]) -> bool:
+    """Only retryable jobs should stall the single semantic worker."""
+    return bool(payload.get("error")) and payload.get("status") == "retry"
+
+
 def build_worker(config: WorkerDaemonConfig) -> SemanticWorker:
     vector = build_vector_index_from_env()
     if getattr(vector, "healthy", False) is not True:
@@ -380,7 +385,7 @@ def run_daemon(config: WorkerDaemonConfig, *, once: bool = False) -> int:
             _emit("job_result", **payload)
             jobs_since_yield += 1
 
-            if payload["error"]:
+            if _job_needs_retry_backoff(payload):
                 consecutive_errors += 1
                 delay = min(
                     60.0,
@@ -395,6 +400,16 @@ def run_daemon(config: WorkerDaemonConfig, *, once: bool = False) -> int:
                 if once:
                     return 1
                 stop.wait(delay)
+            elif payload["error"]:
+                # max_attempts has already moved this job to terminal `failed`.
+                # Do not make unrelated queued jobs wait through a pointless
+                # final 60-second cooldown.
+                consecutive_errors = 0
+                _emit(
+                    "job_failed_terminal",
+                    job_uuid=job_uuid,
+                    status=payload.get("status"),
+                )
             else:
                 consecutive_errors = 0
 

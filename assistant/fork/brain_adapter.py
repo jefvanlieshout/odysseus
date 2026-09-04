@@ -28,6 +28,19 @@ _ALLOWED_ROLES = frozenset({"user", "assistant", "system", "tool"})
 _ALLOWED_MODES = frozenset({"off", "shadow", "recall"})
 
 
+def _env_flag(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    value = str(raw).strip().casefold()
+    if value in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if value in {"0", "false", "no", "off", "disabled"}:
+        return False
+    logger.warning("Invalid %s=%r; using default=%s", name, raw, default)
+    return default
+
+
 @dataclass(frozen=True)
 class BrainAdapterConfig:
     mode: str = "off"
@@ -38,6 +51,8 @@ class BrainAdapterConfig:
     recall_max_items: int = 6
     recall_max_chars: int = 2800
     default_owner: str = "local"
+    capture_enabled: bool = True
+    recall_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "BrainAdapterConfig":
@@ -78,6 +93,8 @@ class BrainAdapterConfig:
             mode=str(
                 os.environ.get("ASSISTANT_BRAIN_MODE", "off") or "off"
             ).strip().casefold(),
+            capture_enabled=_env_flag("ASSISTANT_BRAIN_CAPTURE_ENABLED", True),
+            recall_enabled=_env_flag("ASSISTANT_BRAIN_RECALL_ENABLED", True),
             base_url=str(
                 os.environ.get("JARVIS_BRAIN_URL", "") or ""
             ).strip().rstrip("/"),
@@ -100,7 +117,9 @@ class BrainAdapterConfig:
     def validation_error(self) -> str | None:
         if self.mode not in _ALLOWED_MODES:
             return f"unsupported Brain mode: {self.mode!r}"
-        if self.mode == "off":
+        active_capture = self.capture_enabled and self.mode in {"shadow", "recall"}
+        active_recall = self.recall_enabled and self.mode == "recall"
+        if self.mode == "off" or not (active_capture or active_recall):
             return None
         if not self.default_owner:
             return "ASSISTANT_BRAIN_DEFAULT_OWNER must not be empty"
@@ -232,7 +251,7 @@ class BrainMemoryAdapter:
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "Cache-Control": "no-store",
-                "User-Agent": "Odysseus-BrainRecall/0.4.0",
+                "User-Agent": "Odysseus-BrainRecall/0.4.1",
                 "Connection": "close",
             },
         )
@@ -348,7 +367,7 @@ class BrainMemoryAdapter:
         ) = (),
     ) -> BrainRecallResult:
         # Fetch bounded reference context for one live user turn.
-        if self.config.mode != "recall":
+        if self.config.mode != "recall" or not self.config.recall_enabled:
             return BrainRecallResult(
                 False, False, None, None, None, "disabled"
             )
@@ -472,7 +491,7 @@ class BrainMemoryAdapter:
         pending semantic job. Other roles are transcript-only and therefore
         cannot accidentally become claims about the user.
         """
-        if self.config.mode == "off":
+        if self.config.mode == "off" or not self.config.capture_enabled:
             return ShadowCaptureResult(False, False, None, None, "disabled")
 
         error = self.config.validation_error()

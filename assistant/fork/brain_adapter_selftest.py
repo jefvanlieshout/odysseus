@@ -67,10 +67,12 @@ def _start_server():
     return server, thread
 
 
-def _config(server, mode="shadow"):
+def _config(server, mode="shadow", *, capture_enabled=True, recall_enabled=True):
     host, port = server.server_address
     return BrainAdapterConfig(
         mode=mode,
+        capture_enabled=capture_enabled,
+        recall_enabled=recall_enabled,
         base_url=f"http://{host}:{port}",
         api_key="k" * 40,
         timeout_seconds=1.0,
@@ -191,6 +193,27 @@ def main() -> None:
         assert not skipped.attempted
         assert len(server.requests) == before_recall
 
+        # Capture and Recall can now be disabled independently.
+        before_independent = len(server.requests)
+        capture_off = BrainMemoryAdapter(
+            _config(server, mode="recall", capture_enabled=False)
+        )
+        skipped_capture = capture_off.capture_persisted_message(
+            owner="jef", session_id="s", message_id="m-capture-off",
+            role="user", content="remember me",
+        )
+        assert not skipped_capture.attempted
+        assert len(server.requests) == before_independent
+
+        recall_off = BrainMemoryAdapter(
+            _config(server, mode="recall", recall_enabled=False)
+        )
+        skipped_recall = recall_off.recall_for_prompt(
+            owner="jef", query="remember me?"
+        )
+        assert not skipped_recall.attempted
+        assert len(server.requests) == before_independent
+
         server.reply_payload = {
             "ok": True,
             "candidate_count": 1,
@@ -281,6 +304,19 @@ def main() -> None:
         assert result.status_code == 409
         assert "idempotency" in (result.error or "")
 
+        # Environment flags independently gate capture and recall.
+        with patch.dict(
+            os.environ,
+            {
+                "ASSISTANT_BRAIN_CAPTURE_ENABLED": "0",
+                "ASSISTANT_BRAIN_RECALL_ENABLED": "off",
+            },
+            clear=False,
+        ):
+            cfg = BrainAdapterConfig.from_env()
+            assert not cfg.capture_enabled
+            assert not cfg.recall_enabled
+
         # Environment helper stays off by default.
         with patch.dict(os.environ, {}, clear=True):
             result = shadow_persisted_message(
@@ -319,6 +355,8 @@ def main() -> None:
             build_start:build_end
         ]
         assert "brain_recall_for_prompt" in build_body
+        assert "brain_recall_enabled" in build_body
+        assert 'uprefs.get("brain_recall_enabled", True)' in build_body
         assert "await asyncio.to_thread(" in build_body
         assert "current_message_ref" in build_body
         assert '"Jarvis Brain recall"' in build_body

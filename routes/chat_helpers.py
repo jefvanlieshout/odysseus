@@ -675,21 +675,28 @@ async def build_chat_context(
     )
     casual_low_signal = _is_casual_low_signal(context_message)
 
-    # Memory enabled?
+    # Native Odysseus memory and Jarvis Brain recall are independent gates.
+    # `no_memory` / incognito remain hard privacy boundaries for both systems,
+    # but disabling the legacy native-memory preference must not silently turn
+    # Brain Recall off as well.
     mem_enabled = not incognito and not no_memory and uprefs.get("memory_enabled", True)
+    brain_recall_enabled = (
+        not incognito
+        and not no_memory
+        and uprefs.get("brain_recall_enabled", True)
+    )
+
     # Skills injection respects its own enable toggle (mirrors memory_enabled).
     # When off, the "Available skills" index is not added to the prompt.
     skills_enabled = not incognito and uprefs.get("skills_enabled", True)
     if not allow_tool_preprocessing:
         mem_enabled = False
+        brain_recall_enabled = False
         skills_enabled = False
     if casual_low_signal:
         mem_enabled = False
+        brain_recall_enabled = False
         skills_enabled = False
-    logger.debug(
-        "Memory enabled=%s for user=%s (incognito=%s, no_memory=%s, pref=%s)",
-        mem_enabled, user, incognito, no_memory, uprefs.get("memory_enabled", "NOT_SET"),
-    )
 
     # Research-spinoff ("Discuss") sessions are grounded on the seeded report:
     # the primer system message IS the knowledge base. Injecting global memory
@@ -698,11 +705,24 @@ async def build_chat_context(
     is_research_spinoff = _session_is_research_spinoff(sess)
     if is_research_spinoff:
         mem_enabled = False
+        brain_recall_enabled = False
+
+    logger.debug(
+        "Memory gates native=%s brain_recall=%s for user=%s "
+        "(incognito=%s, no_memory=%s, native_pref=%s, brain_pref=%s)",
+        mem_enabled,
+        brain_recall_enabled,
+        user,
+        incognito,
+        no_memory,
+        uprefs.get("memory_enabled", "NOT_SET"),
+        uprefs.get("brain_recall_enabled", "NOT_SET"),
+    )
 
     # Brain v0.4 recall: one read for the newly persisted user turn.
     brain_recall_result = None
     if (
-        mem_enabled
+        brain_recall_enabled
         and persist_user_message
         and str(context_message or "").strip()
     ):
@@ -1285,7 +1305,14 @@ def run_post_response_tasks(
     # Memory extraction — only every 4th message pair to avoid excess LLM calls
     _msg_count = len(sess.history) if hasattr(sess, 'history') else 0
     _should_extract = (_msg_count >= 4) and (_msg_count % 4 == 0)
-    if allow_background_extraction and not incognito and not compare_mode and _should_extract and uprefs.get("auto_memory", True):
+    if (
+        allow_background_extraction
+        and not incognito
+        and not compare_mode
+        and _should_extract
+        and uprefs.get("memory_enabled", True)
+        and uprefs.get("auto_memory", True)
+    ):
         from services.memory.memory_extractor import extract_and_store
         from src.task_endpoint import resolve_task_endpoint
         t_url, t_model, t_headers = resolve_task_endpoint(

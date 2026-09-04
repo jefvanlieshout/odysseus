@@ -11,6 +11,7 @@ from jarvis_brain.worker_daemon import (
     _model_id_matches,
     _probe_llm,
     _result_payload,
+    _job_needs_retry_backoff,
     run_daemon,
 )
 
@@ -176,6 +177,18 @@ class WorkerDaemonTests(unittest.TestCase):
         self.assertEqual(payload["committed"][0]["action"], "UPDATE")
         self.assertTrue(payload["committed"][0]["changed"])
         self.assertIsNone(payload["error"])
+
+    def test_only_retry_status_requests_daemon_backoff(self):
+        self.assertTrue(_job_needs_retry_backoff({
+            "status": "retry", "error": "temporary failure"
+        }))
+        self.assertFalse(_job_needs_retry_backoff({
+            "status": "failed", "error": "terminal failure"
+        }))
+        self.assertFalse(_job_needs_retry_backoff({
+            "status": "done", "error": None
+        }))
+
 
 
 if __name__ == "__main__":

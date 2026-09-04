@@ -279,6 +279,86 @@ class ReasonerTests(unittest.TestCase):
         self.assertIn("reasoning_tokens=300", message)
         self.assertNotIn("private reasoning text", message)
 
+    def test_length_truncation_retries_same_operation_with_larger_budget(self):
+        truncated = {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "private reasoning that must not leak",
+                },
+            }],
+            "usage": {"completion_tokens": 900},
+        }
+        self.server.replies.append((200, json.dumps(truncated).encode("utf-8")))
+        self.reply({"candidates": [{
+            "content": "The user prefers purple terminal themes.",
+            "memory_type": "preference",
+            "scope": "terminal",
+            "confidence": 0.95,
+            "evidence_quote": "prefer purple terminal themes",
+        }]})
+
+        result = self.reasoner.propose_candidates(
+            evidence_text="I prefer purple terminal themes.",
+            evidence_uuid="e-retry",
+            owner_id="jef",
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(self.server.requests), 2)
+        self.assertEqual(
+            [request["body"]["max_tokens"] for request in self.server.requests],
+            [900, 1800],
+        )
+
+    def test_non_length_empty_content_does_not_retry(self):
+        raw = json.dumps({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": ""},
+            }],
+            "usage": {"completion_tokens": 12},
+        }).encode("utf-8")
+        self.server.replies.append((200, raw))
+
+        with self.assertRaises(StructuredReasonerError):
+            self.reasoner.propose_candidates(
+                evidence_text="I prefer Linux.", evidence_uuid="e", owner_id="j"
+            )
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_length_truncation_exhausts_bounded_retry_ladder(self):
+        for budget in (900, 1800, 3600, 4096):
+            raw = json.dumps({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "private reasoning",
+                    },
+                }],
+                "usage": {"completion_tokens": budget},
+            }).encode("utf-8")
+            self.server.replies.append((200, raw))
+
+        with self.assertRaises(StructuredReasonerError) as caught:
+            self.reasoner.propose_candidates(
+                evidence_text="I prefer Linux.", evidence_uuid="e", owner_id="j"
+            )
+
+        self.assertEqual(
+            [request["body"]["max_tokens"] for request in self.server.requests],
+            [900, 1800, 3600, 4096],
+        )
+        message = str(caught.exception)
+        self.assertIn("attempts=4", message)
+        self.assertIn("budgets=[900, 1800, 3600, 4096]", message)
+        self.assertNotIn("private reasoning", message)
+
+
     def test_reasoning_effort_rejects_non_qwen_level(self):
         with self.assertRaises(StructuredReasonerError):
             OpenAIJsonReasoner(StructuredReasonerConfig(

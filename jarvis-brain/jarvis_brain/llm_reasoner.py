@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -14,6 +15,10 @@ from .semantic_worker import (
     ProvenanceAssessment,
 )
 from .types import ClaimStatus, RelationDecision, SearchHit, SemanticCandidate, SemanticRelation
+
+
+logger = logging.getLogger(__name__)
+_STRUCTURED_RETRY_CEILING = 4096
 
 
 class StructuredReasonerError(RuntimeError):
@@ -78,6 +83,10 @@ class StructuredReasonerConfig:
             raise StructuredReasonerError("BRAIN_LLM_URL must not contain credentials, query, or fragment")
         if not self.model:
             raise StructuredReasonerError("BRAIN_LLM_MODEL is required")
+        if not 64 <= int(self.max_tokens) <= _STRUCTURED_RETRY_CEILING:
+            raise StructuredReasonerError(
+                f"max_tokens must be between 64 and {_STRUCTURED_RETRY_CEILING}"
+            )
         if self.reasoning_effort is not None and self.reasoning_effort not in {"low", "medium", "xhigh"}:
             raise StructuredReasonerError(
                 "BRAIN_LLM_REASONING_EFFORT must be low, medium, xhigh, or disabled"
@@ -210,6 +219,26 @@ class OpenAIJsonReasoner:
             f"reasoning_tokens={reasoning_tokens!r}"
         )
 
+    @staticmethod
+    def _structured_token_budgets(base_tokens: int) -> tuple[int, ...]:
+        """Bounded retry ladder for reasoning models truncated before JSON.
+
+        The first call keeps the configured normal budget.  Retries happen only
+        when the endpoint explicitly reports finish_reason=length before a valid
+        structured object exists.  Earlier semantic-worker stages therefore stay
+        intact: candidate/provenance/relation/consolidation retries are local to
+        the exact failed model operation.
+        """
+        base = max(64, min(_STRUCTURED_RETRY_CEILING, int(base_tokens)))
+        budgets = [base]
+        for multiplier in (2, 4):
+            candidate = min(_STRUCTURED_RETRY_CEILING, base * multiplier)
+            if candidate > budgets[-1]:
+                budgets.append(candidate)
+        if budgets[-1] < _STRUCTURED_RETRY_CEILING:
+            budgets.append(_STRUCTURED_RETRY_CEILING)
+        return tuple(budgets)
+
     def _call(self, *, operation: str, schema: dict[str, Any], system: str, user: str) -> dict[str, Any]:
         response_format = {
             "type": "json_schema",
@@ -219,24 +248,11 @@ class OpenAIJsonReasoner:
                 "schema": schema,
             },
         }
-        body = {
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-            "stream": False,
-            "response_format": response_format,
-        }
-        if self.config.reasoning_effort is not None:
-            body["reasoning_effort"] = self.config.reasoning_effort
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Cache-Control": "no-store",
-            "User-Agent": "JarvisBrainStructuredReasoner/0.3.0",
+            "User-Agent": "JarvisBrainStructuredReasoner/0.4.1",
             "Connection": "close",
         }
         if self.config.api_key:
@@ -246,54 +262,117 @@ class OpenAIJsonReasoner:
                 continue
             headers[key] = value
 
-        request = Request(
-            self.config.chat_url,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            method="POST",
-            headers=headers,
-        )
-        try:
-            with urlopen(request, timeout=self.config.timeout_seconds) as response:
-                raw = response.read(4 * 1024 * 1024)
-                status = int(getattr(response, "status", 200))
-        except HTTPError as exc:
-            try:
-                detail = exc.read(8192).decode("utf-8", errors="replace")
-            finally:
-                exc.close()
-            raise StructuredReasonerError(f"LLM HTTP {exc.code}: {detail[:1000]}") from None
-        except URLError as exc:
-            raise StructuredReasonerError(f"LLM connection error: {exc.reason}") from exc
-        except TimeoutError as exc:
-            raise StructuredReasonerError("LLM request timed out") from exc
+        budgets = self._structured_token_budgets(self.config.max_tokens)
+        attempted_budgets: list[int] = []
 
-        if not 200 <= status < 300:
-            raise StructuredReasonerError(f"LLM returned HTTP {status}")
-        try:
-            envelope = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise StructuredReasonerError("LLM returned invalid response JSON") from exc
-        diagnostics = self._response_diagnostics(envelope, operation=operation)
-        try:
-            message = envelope["choices"][0]["message"]
-            content = message["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise StructuredReasonerError(
-                f"LLM response is missing choices[0].message.content ({diagnostics})"
-            ) from exc
-        if not isinstance(content, str) or not content.strip():
-            raise StructuredReasonerError(
-                f"LLM structured content is empty ({diagnostics})"
+        for attempt, max_tokens in enumerate(budgets, start=1):
+            attempted_budgets.append(max_tokens)
+            body = {
+                "model": self.config.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": self.config.temperature,
+                "max_tokens": max_tokens,
+                "stream": False,
+                "response_format": response_format,
+            }
+            if self.config.reasoning_effort is not None:
+                body["reasoning_effort"] = self.config.reasoning_effort
+
+            request = Request(
+                self.config.chat_url,
+                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                method="POST",
+                headers=headers,
             )
-        try:
-            result = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise StructuredReasonerError(
-                f"LLM structured content is not valid JSON ({diagnostics})"
-            ) from exc
-        if not isinstance(result, dict):
-            raise StructuredReasonerError("LLM structured content must be a JSON object")
-        return result
+            try:
+                with urlopen(request, timeout=self.config.timeout_seconds) as response:
+                    raw = response.read(4 * 1024 * 1024)
+                    status = int(getattr(response, "status", 200))
+            except HTTPError as exc:
+                try:
+                    detail = exc.read(8192).decode("utf-8", errors="replace")
+                finally:
+                    exc.close()
+                raise StructuredReasonerError(f"LLM HTTP {exc.code}: {detail[:1000]}") from None
+            except URLError as exc:
+                raise StructuredReasonerError(f"LLM connection error: {exc.reason}") from exc
+            except TimeoutError as exc:
+                raise StructuredReasonerError("LLM request timed out") from exc
+
+            if not 200 <= status < 300:
+                raise StructuredReasonerError(f"LLM returned HTTP {status}")
+            try:
+                envelope = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise StructuredReasonerError("LLM returned invalid response JSON") from exc
+
+            diagnostics = self._response_diagnostics(envelope, operation=operation)
+            choice = None
+            message = None
+            finish_reason = None
+            try:
+                choices = envelope.get("choices") if isinstance(envelope, dict) else None
+                choice = choices[0] if isinstance(choices, list) and choices else None
+                if isinstance(choice, dict):
+                    finish_reason = choice.get("finish_reason")
+                    message = choice.get("message")
+            except Exception:
+                choice = None
+                message = None
+
+            content = message.get("content") if isinstance(message, dict) else None
+            truncated = str(finish_reason or "").casefold() == "length"
+            can_retry = truncated and attempt < len(budgets)
+
+            if not isinstance(content, str) or not content.strip():
+                if can_retry:
+                    next_budget = budgets[attempt]
+                    logger.warning(
+                        "[brain-reasoner] event=structured_retry "
+                        "operation=%s attempt=%s max_tokens=%s next_max_tokens=%s %s",
+                        operation, attempt, max_tokens, next_budget, diagnostics,
+                    )
+                    continue
+                raise StructuredReasonerError(
+                    "LLM structured content is empty "
+                    f"({diagnostics} attempts={attempt} budgets={attempted_budgets})"
+                )
+
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError as exc:
+                if can_retry:
+                    next_budget = budgets[attempt]
+                    logger.warning(
+                        "[brain-reasoner] event=structured_retry "
+                        "operation=%s attempt=%s max_tokens=%s next_max_tokens=%s "
+                        "reason=truncated_json %s",
+                        operation, attempt, max_tokens, next_budget, diagnostics,
+                    )
+                    continue
+                raise StructuredReasonerError(
+                    "LLM structured content is not valid JSON "
+                    f"({diagnostics} attempts={attempt} budgets={attempted_budgets})"
+                ) from exc
+
+            if not isinstance(result, dict):
+                raise StructuredReasonerError("LLM structured content must be a JSON object")
+
+            if attempt > 1:
+                logger.info(
+                    "[brain-reasoner] event=structured_recovered "
+                    "operation=%s attempts=%s final_max_tokens=%s budgets=%s",
+                    operation, attempt, max_tokens, attempted_budgets,
+                )
+            return result
+
+        raise StructuredReasonerError(
+            f"LLM structured operation exhausted retry ladder: operation={operation} "
+            f"budgets={attempted_budgets}"
+        )
 
     def propose_candidates(
         self,
