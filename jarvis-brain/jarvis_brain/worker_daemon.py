@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -146,16 +147,27 @@ def _default_ready_url(chat_url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
+def _model_artifact_key(value: str) -> str:
+    # Normalize logical IDs and llama.cpp GGUF artifact paths.
+    # Qwen/Qwen3.8-27B and .../Qwen3.8-27B-Q4_K_M.gguf are the same model;
+    # the Q4_K_M suffix describes packaging/quantization, not model identity.
+    base = str(value or "").strip().casefold().replace("\\", "/").rsplit("/", 1)[-1]
+    for suffix in (".gguf", ".bin"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    base = re.sub(r"-(?:i?q\d+(?:_[a-z0-9]+)*)$", "", base)
+    return base
+
+
 def _model_id_matches(expected: str, actual: str) -> bool:
-    expected = str(expected or "").strip().casefold()
-    actual = str(actual or "").strip().casefold()
-    if not expected or not actual:
+    expected_raw = str(expected or "").strip().casefold()
+    actual_raw = str(actual or "").strip().casefold()
+    if not expected_raw or not actual_raw:
         return False
-    if expected == actual:
+    if expected_raw == actual_raw:
         return True
-    expected_base = expected.rsplit("/", 1)[-1]
-    actual_base = actual.rsplit("/", 1)[-1]
-    return expected_base == actual_base
+    return _model_artifact_key(expected_raw) == _model_artifact_key(actual_raw)
 
 
 def _probe_llm(config: WorkerDaemonConfig) -> tuple[bool, str]:

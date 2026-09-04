@@ -109,9 +109,22 @@ class WorkerDaemonTests(unittest.TestCase):
             "http://127.0.0.1:8000/v1/models",
         )
 
-    def test_model_match_accepts_same_basename_only(self):
+    def test_model_match_accepts_logical_id_and_llamacpp_gguf_artifact(self):
         self.assertTrue(_model_id_matches("Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B"))
         self.assertTrue(_model_id_matches("Qwen/Qwen3.8-27B", "Qwen3.8-27B"))
+        self.assertTrue(_model_id_matches(
+            "Qwen/Qwen3.8-27B",
+            "/app/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B/"
+            "snapshots/abc/Qwen3.8-27B-Q4_K_M.gguf",
+        ))
+        self.assertTrue(_model_id_matches(
+            "Qwen/Qwen3.8-27B",
+            "/models/Qwen3.8-27B-IQ4_XS.gguf",
+        ))
+        self.assertFalse(_model_id_matches(
+            "Qwen/Qwen3.8-27B",
+            "/models/Qwen3.8-14B-Q4_K_M.gguf",
+        ))
         self.assertFalse(_model_id_matches("Qwen/Qwen3.8-27B", "other/model"))
 
     def test_probe_llm_requires_expected_model(self):

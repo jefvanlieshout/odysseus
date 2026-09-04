@@ -1,9 +1,14 @@
 FROM python:3.13-slim
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
+
+# Keep expensive runtime dependencies independent from Brain source code.
+# Normal Python edits can now reuse this cached layer.
+RUN pip install --no-cache-dir \
+    chromadb==1.5.9 \
+    fastembed==0.8.0
+
 COPY jarvis_brain ./jarvis_brain
-RUN pip install --no-cache-dir '.[vector]'
 
 RUN useradd --create-home --uid 10001 brain
 USER brain
@@ -18,4 +23,4 @@ ENV BRAIN_EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v
 ENV BRAIN_EMBED_CACHE=/data/fastembed-cache
 
 EXPOSE 8765
-CMD ["brain-foundation", "serve", "--host", "0.0.0.0", "--port", "8765"]
+CMD ["python", "-m", "jarvis_brain.cli", "serve", "--host", "0.0.0.0", "--port", "8765"]
