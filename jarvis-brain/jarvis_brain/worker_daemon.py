@@ -43,6 +43,7 @@ class WorkerDaemonConfig:
     llm_timeout_seconds: float
     llm_max_tokens: int
     llm_temperature: float
+    llm_reasoning_effort: str | None
     poll_seconds: float
     error_backoff_seconds: float
     lease_seconds: int
@@ -73,6 +74,16 @@ class WorkerDaemonConfig:
 
         default_worker_id = f"{socket.gethostname()}:{os.getpid()}"
 
+        raw_effort = os.environ.get("BRAIN_LLM_REASONING_EFFORT", "medium").strip().casefold()
+        if raw_effort in {"", "none", "off", "disabled"}:
+            reasoning_effort = None
+        elif raw_effort in {"low", "medium", "xhigh"}:
+            reasoning_effort = raw_effort
+        else:
+            raise ValueError(
+                "BRAIN_LLM_REASONING_EFFORT must be low, medium, xhigh, or disabled"
+            )
+
         return cls(
             db_path=os.environ.get("BRAIN_DB_PATH", "/data/brain.db"),
             llm_url=llm_url,
@@ -85,6 +96,7 @@ class WorkerDaemonConfig:
             llm_temperature=_env_float(
                 "BRAIN_LLM_TEMPERATURE", 0.0, minimum=0.0
             ),
+            llm_reasoning_effort=reasoning_effort,
             poll_seconds=_env_float(
                 "BRAIN_WORKER_POLL_SECONDS", 2.0, minimum=0.1
             ),
@@ -154,6 +166,7 @@ def build_worker(config: WorkerDaemonConfig) -> SemanticWorker:
             timeout_seconds=config.llm_timeout_seconds,
             max_tokens=config.llm_max_tokens,
             temperature=config.llm_temperature,
+            reasoning_effort=config.llm_reasoning_effort,
         )
     )
     return SemanticWorker(
@@ -186,6 +199,7 @@ def _check(config: WorkerDaemonConfig) -> None:
         vector_backend=type(vector).__name__,
         model=config.llm_model,
         llm_host=urlsplit(config.llm_url).hostname,
+        reasoning_effort=config.llm_reasoning_effort,
     )
 
 
@@ -206,6 +220,7 @@ def run_daemon(config: WorkerDaemonConfig, *, once: bool = False) -> int:
         db_path=config.db_path,
         model=config.llm_model,
         llm_host=urlsplit(config.llm_url).hostname,
+        reasoning_effort=config.llm_reasoning_effort,
         poll_seconds=config.poll_seconds,
         lease_seconds=config.lease_seconds,
         max_consecutive_jobs=config.max_consecutive_jobs,

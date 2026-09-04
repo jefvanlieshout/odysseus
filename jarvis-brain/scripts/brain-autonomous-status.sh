@@ -34,12 +34,21 @@ try:
             "knowledge_relations",
         )
     }
+    recent_failures = [
+        dict(row)
+        for row in db.execute(
+            "SELECT uuid AS job_uuid, status, attempt_count, last_error, next_attempt_at "
+            "FROM semantic_jobs WHERE status IN ('retry','failed') "
+            "ORDER BY updated_at DESC, id DESC LIMIT 5"
+        ).fetchall()
+    ]
     print(json.dumps({
         "schema_version": int(db.execute(
             "SELECT value FROM brain_meta WHERE key='schema_version'"
         ).fetchone()[0]),
         "integrity": db.execute("PRAGMA integrity_check").fetchone()[0],
         "job_statuses": statuses,
+        "recent_job_failures": recent_failures,
         **counts,
     }, indent=2, sort_keys=True))
 finally:

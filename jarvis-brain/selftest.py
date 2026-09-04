@@ -11,4 +11,4 @@ suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
 result = unittest.TextTestRunner(verbosity=2).run(suite)
 if not result.wasSuccessful():
     raise SystemExit(1)
-print("\nJarvis Brain v0.3.0 foundation + vector/sidecar + semantic-worker-core contracts: PASS")
+print("\nJarvis Brain v0.3.0 autonomous ingestion contracts: PASS")

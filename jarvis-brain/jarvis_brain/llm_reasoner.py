@@ -29,6 +29,7 @@ class StructuredReasonerConfig:
     timeout_seconds: float = 60.0
     max_tokens: int = 900
     temperature: float = 0.0
+    reasoning_effort: str | None = "medium"
 
     @classmethod
     def from_env(cls) -> "StructuredReasonerConfig":
@@ -50,6 +51,12 @@ class StructuredReasonerConfig:
             max_tokens = int(os.environ.get("BRAIN_LLM_MAX_TOKENS", "900") or "900")
         except ValueError:
             max_tokens = 900
+        raw_effort = os.environ.get("BRAIN_LLM_REASONING_EFFORT", "medium").strip().casefold()
+        reasoning_effort = (
+            None
+            if raw_effort in {"", "none", "off", "disabled"}
+            else raw_effort
+        )
         return cls(
             chat_url=os.environ.get("BRAIN_LLM_URL", "").strip(),
             model=os.environ.get("BRAIN_LLM_MODEL", "").strip(),
@@ -58,6 +65,7 @@ class StructuredReasonerConfig:
             timeout_seconds=min(300.0, max(1.0, timeout)),
             max_tokens=min(4096, max(128, max_tokens)),
             temperature=0.0,
+            reasoning_effort=reasoning_effort,
         )
 
     def validate(self) -> None:
@@ -70,6 +78,10 @@ class StructuredReasonerConfig:
             raise StructuredReasonerError("BRAIN_LLM_URL must not contain credentials, query, or fragment")
         if not self.model:
             raise StructuredReasonerError("BRAIN_LLM_MODEL is required")
+        if self.reasoning_effort is not None and self.reasoning_effort not in {"low", "medium", "xhigh"}:
+            raise StructuredReasonerError(
+                "BRAIN_LLM_REASONING_EFFORT must be low, medium, xhigh, or disabled"
+            )
 
 
 _MEMORY_TYPES = ["preference", "fact", "project", "constraint", "relationship", "other"]
@@ -161,6 +173,43 @@ class OpenAIJsonReasoner:
                 f"{context} returned unexpected keys: expected {sorted(required)}, got {sorted(payload)}"
             )
 
+    @staticmethod
+    def _response_diagnostics(envelope: Any, *, operation: str) -> str:
+        """Return metadata-only diagnostics; never include prompts or reasoning text."""
+        choice = None
+        message = None
+        finish_reason = None
+        try:
+            choices = envelope.get("choices") if isinstance(envelope, dict) else None
+            choice = choices[0] if isinstance(choices, list) and choices else None
+            if isinstance(choice, dict):
+                finish_reason = choice.get("finish_reason")
+                message = choice.get("message")
+        except Exception:
+            choice = None
+            message = None
+
+        content = message.get("content") if isinstance(message, dict) else None
+        reasoning = None
+        if isinstance(message, dict):
+            reasoning = message.get("reasoning_content")
+            if reasoning is None:
+                reasoning = message.get("reasoning")
+
+        usage = envelope.get("usage") if isinstance(envelope, dict) else None
+        completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+        reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+
+        return (
+            f"operation={operation} "
+            f"finish_reason={finish_reason!r} "
+            f"content_chars={len(content) if isinstance(content, str) else 0} "
+            f"reasoning_chars={len(reasoning) if isinstance(reasoning, str) else 0} "
+            f"completion_tokens={completion_tokens!r} "
+            f"reasoning_tokens={reasoning_tokens!r}"
+        )
+
     def _call(self, *, operation: str, schema: dict[str, Any], system: str, user: str) -> dict[str, Any]:
         response_format = {
             "type": "json_schema",
@@ -181,6 +230,8 @@ class OpenAIJsonReasoner:
             "stream": False,
             "response_format": response_format,
         }
+        if self.config.reasoning_effort is not None:
+            body["reasoning_effort"] = self.config.reasoning_effort
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -222,17 +273,24 @@ class OpenAIJsonReasoner:
             envelope = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise StructuredReasonerError("LLM returned invalid response JSON") from exc
+        diagnostics = self._response_diagnostics(envelope, operation=operation)
         try:
             message = envelope["choices"][0]["message"]
             content = message["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise StructuredReasonerError("LLM response is missing choices[0].message.content") from exc
+            raise StructuredReasonerError(
+                f"LLM response is missing choices[0].message.content ({diagnostics})"
+            ) from exc
         if not isinstance(content, str) or not content.strip():
-            raise StructuredReasonerError("LLM structured content is empty")
+            raise StructuredReasonerError(
+                f"LLM structured content is empty ({diagnostics})"
+            )
         try:
             result = json.loads(content)
         except json.JSONDecodeError as exc:
-            raise StructuredReasonerError("LLM structured content is not valid JSON") from exc
+            raise StructuredReasonerError(
+                f"LLM structured content is not valid JSON ({diagnostics})"
+            ) from exc
         if not isinstance(result, dict):
             raise StructuredReasonerError("LLM structured content must be a JSON object")
         return result

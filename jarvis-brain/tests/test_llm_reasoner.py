@@ -113,6 +113,7 @@ class ReasonerTests(unittest.TestCase):
         self.assertTrue(rf["json_schema"]["strict"])
         self.assertEqual(request["body"]["temperature"], 0.0)
         self.assertFalse(request["body"]["stream"])
+        self.assertEqual(request["body"]["reasoning_effort"], "medium")
         self.assertEqual(request["headers"].get("Authorization"), "Bearer secret")
 
     def test_empty_candidate_array_is_valid(self):
@@ -208,6 +209,46 @@ class ReasonerTests(unittest.TestCase):
         self.server.replies.append((200, b'not-json'))
         with self.assertRaises(StructuredReasonerError):
             self.reasoner.propose_candidates(evidence_text="x", evidence_uuid="e", owner_id="j")
+
+    def test_empty_content_reports_safe_qwen_diagnostics(self):
+        raw = json.dumps({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "private reasoning text that must never be logged",
+                },
+            }],
+            "usage": {
+                "completion_tokens": 321,
+                "completion_tokens_details": {"reasoning_tokens": 300},
+            },
+        }).encode("utf-8")
+        self.server.replies.append((200, raw))
+
+        with self.assertRaises(StructuredReasonerError) as caught:
+            self.reasoner.propose_candidates(
+                evidence_text="I prefer Linux.",
+                evidence_uuid="e",
+                owner_id="j",
+            )
+
+        message = str(caught.exception)
+        self.assertIn("operation=candidate_proposals", message)
+        self.assertIn("finish_reason='stop'", message)
+        self.assertIn("content_chars=0", message)
+        self.assertIn("completion_tokens=321", message)
+        self.assertIn("reasoning_tokens=300", message)
+        self.assertNotIn("private reasoning text", message)
+
+    def test_reasoning_effort_rejects_non_qwen_level(self):
+        with self.assertRaises(StructuredReasonerError):
+            OpenAIJsonReasoner(StructuredReasonerConfig(
+                chat_url="http://127.0.0.1:8080/v1/chat/completions",
+                model="qwen",
+                reasoning_effort="high",
+            ))
 
     def test_config_rejects_credentials_in_url(self):
         with self.assertRaises(StructuredReasonerError):

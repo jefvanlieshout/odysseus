@@ -315,22 +315,19 @@ class SemanticWorker:
         rejections: list[dict] = []
 
         for index, proposal in enumerate(proposals):
-            try:
-                transition = self._plan_candidate(
-                    owner_id=owner_id,
-                    evidence_uuid=evidence_uuid,
-                    evidence_text=evidence_text,
-                    proposal=proposal,
-                )
-                if transition is None:
-                    rejections.append({"candidate_index": index, "reason": "not durable/grounded"})
-                else:
-                    transitions.append(transition)
-            except Exception as exc:
-                rejections.append({
-                    "candidate_index": index,
-                    "reason": f"{type(exc).__name__}: {exc}",
-                })
+            # Semantic rejection is represented explicitly by ``None``.
+            # Processing/model/validation exceptions are NOT semantic decisions:
+            # let them escape so run_once() releases the whole job to retry.
+            transition = self._plan_candidate(
+                owner_id=owner_id,
+                evidence_uuid=evidence_uuid,
+                evidence_text=evidence_text,
+                proposal=proposal,
+            )
+            if transition is None:
+                rejections.append({"candidate_index": index, "reason": "not durable/grounded"})
+            else:
+                transitions.append(transition)
 
         return SemanticJobPlan(tuple(transitions), tuple(rejections))
 

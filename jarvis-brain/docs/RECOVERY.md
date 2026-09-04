@@ -51,14 +51,21 @@ safe while isolated and unacceptable once connected to Gwen:
 
 The hardened foundation closes those gaps before any production-memory adapter is added.
 
-## Not yet wired
+## Current v0.3.0 live boundary
 
-- Odysseus live memory backend
-- current `memory.json` import
-- old `jarvis.db` import
-- model-driven episodic consolidation
-- model-driven semantic candidate/provenance/relation pipeline
-- real Chroma/FastEmbed adapter + rebuild/sync tooling
-- HTTP sidecar/API authentication
+Now wired and accepted on the real host:
 
-Those remain deferred until the hardened storage/state-transition contracts pass on the real host.
+- post-commit Odysseus -> Brain shadow transcript/evidence capture;
+- authenticated Brain HTTP sidecar;
+- real Chroma + FastEmbed derived vector index;
+- continuous semantic worker;
+- model-driven candidate, provenance, relation and UPDATE consolidation;
+- Python-owned CREATE / UPDATE / DUPLICATE / CONFLICT;
+- lease/retry/crash-replay/idempotency behavior.
+
+Still deferred:
+
+- replacing Odysseus' native memory backend;
+- importing current `memory.json` / old `jarvis.db`;
+- Brain recall/context injection into Gwen;
+- broader episodic maintenance/decay policy.

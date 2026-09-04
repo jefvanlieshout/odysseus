@@ -204,16 +204,16 @@ class SemanticWorkerTests(unittest.TestCase):
         memories = self.brain.list_memories(owner_id="jef")
         self.assertEqual(memories[0]["current_content"], "The user prefers root-cause Linux fixes.")
 
-    def test_nonliteral_evidence_quote_rejects_before_relation(self):
+    def test_nonliteral_evidence_quote_is_processing_failure_and_retries(self):
         self.capture()
         reasoner = ScriptedReasoner(proposals=[
             CandidateProposal("The user prefers root-cause Linux fixes.", evidence_quote="Windows workaround")
         ])
         result = self.worker(reasoner).run_once()
-        self.assertEqual(result.status, "done")
+        self.assertEqual(result.status, "retry")
         self.assertEqual(len(result.committed), 0)
         self.assertEqual(reasoner.calls["relation"], 0)
-        self.assertIn("literal span", result.rejections[0]["reason"])
+        self.assertIn("literal span", result.error or "")
 
     def test_blocking_provenance_without_repair_rejects_candidate(self):
         self.capture()
@@ -250,7 +250,7 @@ class SemanticWorkerTests(unittest.TestCase):
         )
         self.assertEqual(reasoner.calls["provenance"], 2)
 
-    def test_relation_target_outside_retrieved_owner_set_is_rejected(self):
+    def test_relation_target_outside_retrieved_owner_set_retries_job(self):
         self.capture()
         reasoner = ScriptedReasoner(
             proposals=[CandidateProposal(
@@ -264,9 +264,9 @@ class SemanticWorkerTests(unittest.TestCase):
             ),
         )
         result = self.worker(reasoner).run_once()
-        self.assertEqual(result.status, "done")
+        self.assertEqual(result.status, "retry")
         self.assertEqual(len(result.committed), 0)
-        self.assertIn("outside", result.rejections[0]["reason"])
+        self.assertIn("outside", result.error or "")
 
     def test_match_is_duplicate_and_does_not_rewrite(self):
         target = self.create_existing_memory()
@@ -333,6 +333,61 @@ class SemanticWorkerTests(unittest.TestCase):
         )
         result = self.worker(reasoner).run_once()
         self.assertEqual(len(result.committed), 0)
+        self.assertEqual(len(self.brain.memory_history(owner_id="jef", memory_uuid=target)), 1)
+
+    def test_model_exception_during_provenance_requeues_job(self):
+        self.capture()
+        reasoner = ScriptedReasoner(
+            proposals=[CandidateProposal(
+                "The user prefers root-cause Linux fixes.",
+                "preference", "linux", 0.95, "root-cause Linux fixes",
+            )],
+            provenance=[RuntimeError("provenance model failed")],
+        )
+        result = self.worker(reasoner, max_attempts=3).run_once()
+        self.assertEqual(result.status, "retry")
+        self.assertIn("provenance model failed", result.error or "")
+
+    def test_model_exception_during_relation_requeues_job(self):
+        self.capture()
+
+        def broken_relation(**kwargs):
+            raise RuntimeError("relation model failed")
+
+        reasoner = ScriptedReasoner(
+            proposals=[CandidateProposal(
+                "The user prefers root-cause Linux fixes.",
+                "preference", "linux", 0.95, "root-cause Linux fixes",
+            )],
+            relation=broken_relation,
+        )
+        result = self.worker(reasoner, max_attempts=3).run_once()
+        self.assertEqual(result.status, "retry")
+        self.assertIn("relation model failed", result.error or "")
+
+    def test_model_exception_during_consolidation_requeues_job(self):
+        target = self.create_existing_memory()
+        self.capture("I switched from fish shell to zsh shell on Linux.")
+
+        def broken_consolidation(**kwargs):
+            raise RuntimeError("consolidation model failed")
+
+        reasoner = ScriptedReasoner(
+            proposals=[CandidateProposal(
+                "The user now uses zsh shell on Linux.",
+                "fact", "linux", 0.95, "zsh shell",
+            )],
+            relation=lambda **kwargs: RelationDecision(
+                SemanticRelation.STATE_CHANGE,
+                kwargs["neighbors"][0].uuid,
+                0.99,
+                "new shell state",
+            ),
+            consolidation=broken_consolidation,
+        )
+        result = self.worker(reasoner, max_attempts=3).run_once()
+        self.assertEqual(result.status, "retry")
+        self.assertIn("consolidation model failed", result.error or "")
         self.assertEqual(len(self.brain.memory_history(owner_id="jef", memory_uuid=target)), 1)
 
     def test_model_exception_requeues_job_without_losing_evidence(self):

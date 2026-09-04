@@ -93,30 +93,31 @@ pip install -e '.[vector]'
 The tests do not require Chroma/FastEmbed or network access; they use a deterministic
 fake Chroma boundary.
 
-## Deliberately not live yet
+## Live autonomous ingestion (v0.3.0)
 
-- no Odysseus `MEMORY_BACKEND=jarvis_brain` switch
-- no current `memory.json` import
-- no old `jarvis.db` import
-- no model worker for episodic/semantic consolidation
-- no live `BrainMemoryAdapter` wired into `assistant-main`
-- no production Docker start/recreate
+The shadow Brain now mirrors persisted Odysseus conversation rows and runs a
+continuous semantic worker in `jarvis-brain-semantic-worker`.
 
-Those arrive only after this sidecar/vector layer passes real-machine acceptance.
-
-
-## Semantic worker core (v0.3.0)
-
-The worker core is present but no live LLM client or background loop is enabled yet.
-
-- semantic jobs are leased with expiry and retry/backoff state;
-- a validated plan is persisted before semantic commits, so crash recovery replays the same plan;
-- natural observations can yield candidate proposals only;
-- literal evidence quotes are verified by Python before relation reasoning;
-- claim-level provenance is checked with one repair pass and a verify-only pass;
+- user messages atomically create transcript + evidence + episode + semantic job;
+- assistant/system/tool messages remain transcript-only;
+- the worker leases ready jobs, reasons with the configured OpenAI-compatible model,
+  and persists a validated plan before semantic commits;
+- Qwen is explicitly configured with `BRAIN_LLM_REASONING_EFFORT=medium` by default
+  for this bounded structured-memory workload rather than inheriting Qwen3.8's
+  `xhigh` default;
+- literal evidence quotes and claim-level provenance are verified before persistence;
 - semantic relation classification cannot return a database action;
 - Python derives CREATE / UPDATE / DUPLICATE / CONFLICT;
 - UPDATE consolidation receives a final provenance pass before persistence;
-- semantic commit idempotency protects partial-plan replay.
+- semantic commit idempotency protects partial-plan replay;
+- model/transport/structured-output failures retry the entire job and are never
+  disguised as semantic candidate rejection;
+- safe reasoner diagnostics record finish reason and token/field lengths without
+  storing prompts or private reasoning text.
 
-The live shadow Brain should not consume pending jobs until a real Qwen client is added and separately accepted.
+Still intentionally deferred:
+
+- no Odysseus `MEMORY_BACKEND=jarvis_brain` switch;
+- no current `memory.json` import;
+- no old `jarvis.db` import;
+- no Brain-derived context injection into Gwen yet (planned recall milestone).

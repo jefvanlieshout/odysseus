@@ -37,6 +37,7 @@ class WorkerDaemonTests(unittest.TestCase):
             "BRAIN_LLM_TIMEOUT_SECONDS",
             "BRAIN_LLM_MAX_TOKENS",
             "BRAIN_LLM_TEMPERATURE",
+            "BRAIN_LLM_REASONING_EFFORT",
             "BRAIN_WORKER_POLL_SECONDS",
             "BRAIN_WORKER_ERROR_BACKOFF_SECONDS",
             "BRAIN_WORKER_LEASE_SECONDS",
@@ -55,6 +56,7 @@ class WorkerDaemonTests(unittest.TestCase):
         self.assertEqual(config.lease_seconds, 300)
         self.assertEqual(config.poll_seconds, 2.0)
         self.assertEqual(config.llm_headers, {})
+        self.assertEqual(config.llm_reasoning_effort, "medium")
 
     def test_headers_are_parsed_without_changing_types_at_call_boundary(self):
         with patch.dict(
@@ -71,6 +73,22 @@ class WorkerDaemonTests(unittest.TestCase):
             config.llm_headers,
             {"Authorization": "Bearer secret", "X-Test": "123"},
         )
+
+    def test_reasoning_effort_can_be_disabled_but_invalid_values_fail(self):
+        with patch.dict(
+            os.environ,
+            {"BRAIN_LLM_REASONING_EFFORT": "off"},
+            clear=False,
+        ):
+            self.assertIsNone(WorkerDaemonConfig.from_env().llm_reasoning_effort)
+
+        with patch.dict(
+            os.environ,
+            {"BRAIN_LLM_REASONING_EFFORT": "high"},
+            clear=False,
+        ):
+            with self.assertRaises(ValueError):
+                WorkerDaemonConfig.from_env()
 
     def test_result_logging_keeps_python_owned_action(self):
         payload = _result_payload(_Result())

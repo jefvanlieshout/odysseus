@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
@@ -9,6 +10,9 @@ from typing import Iterable
 from .retrieval import NullVectorIndex, VectorIndex, lexical_score
 from .store import BrainStore, new_uuid, utc_now
 from .transitions import derive_persistence_action, relation_edge_type
+logger = logging.getLogger(__name__)
+
+
 from .types import (
     ClaimStatus,
     MemoryStatus,
@@ -222,8 +226,12 @@ class BrainMemoryService:
 
         try:
             self.vector.upsert(owner_id=owner_id, kind="episode", uuid=episode_uuid, text=raw_text)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Brain derived-vector side effect failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
         return {
             "created": True,
             "evidence_uuid": evidence_uuid,
@@ -391,8 +399,12 @@ class BrainMemoryService:
         if result.changed and result.memory_uuid:
             try:
                 self.vector.upsert(owner_id=owner_id, kind="semantic", uuid=result.memory_uuid, text=content)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "Brain derived-vector side effect failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
         return result
 
     def claim_semantic_job(
@@ -581,8 +593,12 @@ class BrainMemoryService:
             )
         try:
             self.vector.upsert(owner_id=owner_id, kind="episode", uuid=episode_uuid, text=summary)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Brain derived-vector side effect failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
 
     def forget_memory(
         self, *, owner_id: str, memory_uuid: str, evidence_uuid: str,
@@ -613,8 +629,12 @@ class BrainMemoryService:
             self._record_memory_event(db, owner_id, idempotency_key, request_hash, memory_uuid, "FORGET", int(evidence["id"]), rev_no, reason, now)
         try:
             self.vector.delete(owner_id=owner_id, kind="semantic", uuid=memory_uuid)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Brain derived-vector side effect failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
         return rev_no
 
     def erase_memory(
@@ -644,8 +664,12 @@ class BrainMemoryService:
             db.execute("DELETE FROM semantic_memories WHERE id=?", (int(memory["id"]),))
         try:
             self.vector.delete(owner_id=owner_id, kind="semantic", uuid=memory_uuid)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Brain derived-vector side effect failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
 
     def pin_memory(
         self, *, owner_id: str, memory_uuid: str, pinned: bool, evidence_uuid: str, idempotency_key: str,
@@ -933,7 +957,12 @@ class BrainMemoryService:
                                         "created_at": row["created_at"],
                                     },
                                 )
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Brain vector retrieval degraded to lexical search: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
             vector_used = False
 
         hits = sorted(candidates.values(), key=lambda h: (h.score, h.uuid), reverse=True)[:limit]
