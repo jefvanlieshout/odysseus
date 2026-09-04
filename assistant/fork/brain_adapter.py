@@ -7,8 +7,9 @@ Shadow mode is deliberately one-way and non-authoritative:
 3. Any Brain failure is reported as telemetry only and MUST NOT undo, alter,
    or block the already-committed Odysseus state.
 
-No memory reads or Brain-derived context are exposed here.  That boundary is
-intentional for assistant-v0.3.0 shadow validation.
+v0.4.0 adds one bounded read path for ephemeral Brain recall context.
+Odysseus remains authoritative for chat persistence; recall is reference data
+only and must fail open without changing native conversation state.
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from urllib.request import Request, urlopen
 logger = logging.getLogger(__name__)
 
 _ALLOWED_ROLES = frozenset({"user", "assistant", "system", "tool"})
-_ALLOWED_MODES = frozenset({"off", "shadow"})
+_ALLOWED_MODES = frozenset({"off", "shadow", "recall"})
 
 
 @dataclass(frozen=True)
@@ -33,22 +34,67 @@ class BrainAdapterConfig:
     base_url: str = ""
     api_key: str = ""
     timeout_seconds: float = 0.5
+    recall_timeout_seconds: float = 2.0
+    recall_max_items: int = 6
+    recall_max_chars: int = 2800
     default_owner: str = "local"
 
     @classmethod
     def from_env(cls) -> "BrainAdapterConfig":
-        raw_timeout = os.environ.get("ASSISTANT_BRAIN_TIMEOUT_SECONDS", "0.5")
         try:
-            timeout = float(raw_timeout)
+            timeout = float(
+                os.environ.get(
+                    "ASSISTANT_BRAIN_TIMEOUT_SECONDS", "0.5"
+                )
+            )
         except (TypeError, ValueError):
             timeout = 0.5
-        timeout = min(5.0, max(0.05, timeout))
+        try:
+            recall_timeout = float(
+                os.environ.get(
+                    "ASSISTANT_BRAIN_RECALL_TIMEOUT_SECONDS", "2.0"
+                )
+            )
+        except (TypeError, ValueError):
+            recall_timeout = 2.0
+        try:
+            recall_max_items = int(
+                os.environ.get(
+                    "ASSISTANT_BRAIN_RECALL_MAX_ITEMS", "6"
+                ) or "6"
+            )
+        except (TypeError, ValueError):
+            recall_max_items = 6
+        try:
+            recall_max_chars = int(
+                os.environ.get(
+                    "ASSISTANT_BRAIN_RECALL_MAX_CHARS", "2800"
+                ) or "2800"
+            )
+        except (TypeError, ValueError):
+            recall_max_chars = 2800
+
         return cls(
-            mode=str(os.environ.get("ASSISTANT_BRAIN_MODE", "off") or "off").strip().casefold(),
-            base_url=str(os.environ.get("JARVIS_BRAIN_URL", "") or "").strip().rstrip("/"),
-            api_key=str(os.environ.get("JARVIS_BRAIN_API_KEY", "") or ""),
-            timeout_seconds=timeout,
-            default_owner=str(os.environ.get("ASSISTANT_BRAIN_DEFAULT_OWNER", "local") or "local").strip(),
+            mode=str(
+                os.environ.get("ASSISTANT_BRAIN_MODE", "off") or "off"
+            ).strip().casefold(),
+            base_url=str(
+                os.environ.get("JARVIS_BRAIN_URL", "") or ""
+            ).strip().rstrip("/"),
+            api_key=str(
+                os.environ.get("JARVIS_BRAIN_API_KEY", "") or ""
+            ),
+            timeout_seconds=min(5.0, max(0.05, timeout)),
+            recall_timeout_seconds=min(
+                5.0, max(0.10, recall_timeout)
+            ),
+            recall_max_items=max(1, min(recall_max_items, 8)),
+            recall_max_chars=max(512, min(recall_max_chars, 8000)),
+            default_owner=str(
+                os.environ.get(
+                    "ASSISTANT_BRAIN_DEFAULT_OWNER", "local"
+                ) or "local"
+            ).strip(),
         )
 
     def validation_error(self) -> str | None:
@@ -59,14 +105,25 @@ class BrainAdapterConfig:
         if not self.default_owner:
             return "ASSISTANT_BRAIN_DEFAULT_OWNER must not be empty"
         if not self.base_url:
-            return "JARVIS_BRAIN_URL is required in shadow mode"
+            return "JARVIS_BRAIN_URL is required when Brain is enabled"
         parts = urlsplit(self.base_url)
         if parts.scheme not in {"http", "https"} or not parts.netloc:
             return "JARVIS_BRAIN_URL must be an absolute http(s) URL"
-        if parts.username or parts.password or parts.query or parts.fragment:
-            return "JARVIS_BRAIN_URL must not contain credentials, query, or fragment"
+        if (
+            parts.username
+            or parts.password
+            or parts.query
+            or parts.fragment
+        ):
+            return (
+                "JARVIS_BRAIN_URL must not contain credentials, "
+                "query, or fragment"
+            )
         if len(self.api_key) < 32:
-            return "JARVIS_BRAIN_API_KEY must contain at least 32 characters"
+            return (
+                "JARVIS_BRAIN_API_KEY must contain at least "
+                "32 characters"
+            )
         return None
 
 
@@ -74,6 +131,16 @@ class BrainAdapterConfig:
 class ShadowCaptureResult:
     attempted: bool
     delivered: bool
+    endpoint: str | None = None
+    status_code: int | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class BrainRecallResult:
+    attempted: bool
+    delivered: bool
+    packet: Mapping[str, Any] | None = None
     endpoint: str | None = None
     status_code: int | None = None
     error: str | None = None
@@ -146,6 +213,247 @@ class BrainMemoryAdapter:
                 True, False, endpoint, None, f"{type(exc).__name__}: {exc}"
             )
 
+    def _post_json_payload(
+        self,
+        endpoint: str,
+        payload: Mapping[str, Any],
+        *,
+        timeout_seconds: float,
+    ) -> tuple[ShadowCaptureResult, dict[str, Any] | None]:
+        body = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True
+        ).encode("utf-8")
+        request = Request(
+            self.config.base_url + endpoint,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Cache-Control": "no-store",
+                "User-Agent": "Odysseus-BrainRecall/0.4.0",
+                "Connection": "close",
+            },
+        )
+        try:
+            with urlopen(
+                request, timeout=timeout_seconds
+            ) as response:
+                raw = response.read(1024 * 1024)
+                status = int(
+                    getattr(response, "status", 200)
+                )
+            if not 200 <= status < 300:
+                return (
+                    ShadowCaptureResult(
+                        True, False, endpoint, status,
+                        f"HTTP {status}"
+                    ),
+                    None,
+                )
+            try:
+                decoded = (
+                    json.loads(raw.decode("utf-8"))
+                    if raw else {}
+                )
+            except Exception:
+                return (
+                    ShadowCaptureResult(
+                        True, False, endpoint, status,
+                        "Brain returned invalid JSON"
+                    ),
+                    None,
+                )
+            if not isinstance(decoded, dict):
+                return (
+                    ShadowCaptureResult(
+                        True, False, endpoint, status,
+                        "Brain returned non-object JSON"
+                    ),
+                    None,
+                )
+            if decoded.get("ok") is False:
+                return (
+                    ShadowCaptureResult(
+                        True, False, endpoint, status,
+                        str(
+                            decoded.get("error")
+                            or "Brain rejected request"
+                        ),
+                    ),
+                    decoded,
+                )
+            return (
+                ShadowCaptureResult(
+                    True, True, endpoint, status, None
+                ),
+                decoded,
+            )
+        except HTTPError as exc:
+            try:
+                raw = exc.read(4096)
+                try:
+                    decoded = (
+                        json.loads(raw.decode("utf-8"))
+                        if raw else {}
+                    )
+                    detail = (
+                        decoded.get("error")
+                        if isinstance(decoded, dict)
+                        else None
+                    )
+                except Exception:
+                    detail = None
+                return (
+                    ShadowCaptureResult(
+                        True, False, endpoint, int(exc.code),
+                        str(detail or f"HTTP {exc.code}")
+                    ),
+                    None,
+                )
+            finally:
+                exc.close()
+        except URLError as exc:
+            return (
+                ShadowCaptureResult(
+                    True, False, endpoint, None,
+                    f"connection error: {exc.reason}"
+                ),
+                None,
+            )
+        except TimeoutError:
+            return (
+                ShadowCaptureResult(
+                    True, False, endpoint, None, "timeout"
+                ),
+                None,
+            )
+        except Exception as exc:
+            return (
+                ShadowCaptureResult(
+                    True, False, endpoint, None,
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                None,
+            )
+
+    def recall_for_prompt(
+        self,
+        *,
+        owner: str | None,
+        query: str,
+        exclude_external_source_refs: (
+            list[str] | tuple[str, ...]
+        ) = (),
+    ) -> BrainRecallResult:
+        # Fetch bounded reference context for one live user turn.
+        if self.config.mode != "recall":
+            return BrainRecallResult(
+                False, False, None, None, None, "disabled"
+            )
+
+        error = self.config.validation_error()
+        if error:
+            return BrainRecallResult(
+                False, False, None, None, None, error
+            )
+
+        query = str(query or "").strip()
+        if not query:
+            return BrainRecallResult(
+                False, False, None, None, None, "empty query"
+            )
+
+        owner_id = self._owner(
+            owner, self.config.default_owner
+        )
+        excluded = [
+            str(value).strip()
+            for value in exclude_external_source_refs
+            if str(value or "").strip()
+        ][:16]
+
+        request_result, decoded = self._post_json_payload(
+            "/v1/recall",
+            {
+                "owner_id": owner_id,
+                "query": query,
+                "candidate_limit": 16,
+                "max_items": self.config.recall_max_items,
+                "max_chars": self.config.recall_max_chars,
+                "include_episodes": True,
+                "exclude_external_source_refs": excluded,
+            },
+            timeout_seconds=self.config.recall_timeout_seconds,
+        )
+        if not request_result.delivered or decoded is None:
+            return BrainRecallResult(
+                request_result.attempted,
+                False,
+                None,
+                request_result.endpoint,
+                request_result.status_code,
+                request_result.error,
+            )
+
+        context = decoded.get("context")
+        selected = decoded.get("selected")
+        if not isinstance(context, str) or not isinstance(
+            selected, list
+        ):
+            return BrainRecallResult(
+                True, False, None, "/v1/recall",
+                request_result.status_code,
+                "Brain recall response has invalid shape",
+            )
+        if len(context) > self.config.recall_max_chars:
+            return BrainRecallResult(
+                True, False, None, "/v1/recall",
+                request_result.status_code,
+                "Brain recall response exceeded context budget",
+            )
+
+        packet = {
+            "candidate_count": int(
+                decoded.get("candidate_count") or 0
+            ),
+            "eligible_semantic_count": int(
+                decoded.get(
+                    "eligible_semantic_count"
+                ) or 0
+            ),
+            "eligible_episode_count": int(
+                decoded.get(
+                    "eligible_episode_count"
+                ) or 0
+            ),
+            "selected_count": int(
+                decoded.get("selected_count") or 0
+            ),
+            "selection_mode": str(
+                decoded.get("selection_mode") or "none"
+            ),
+            "selected": selected,
+            "context": context,
+            "context_chars": int(
+                decoded.get("context_chars") or 0
+            ),
+            "budget_chars": int(
+                decoded.get("budget_chars")
+                or self.config.recall_max_chars
+            ),
+            "vector_candidate_count": int(
+                decoded.get(
+                    "vector_candidate_count"
+                ) or 0
+            ),
+        }
+        return BrainRecallResult(
+            True, True, packet, "/v1/recall",
+            request_result.status_code, None
+        )
+
     def capture_persisted_message(
         self,
         *,
@@ -217,6 +525,83 @@ class BrainMemoryAdapter:
             },
         )
 
+
+
+def brain_recall_for_prompt(
+    *,
+    owner: str | None,
+    session_id: str,
+    query: str,
+    exclude_external_source_refs: (
+        list[str] | tuple[str, ...]
+    ) = (),
+) -> BrainRecallResult:
+    # Environment-configured, fail-open recall helper.
+    adapter = BrainMemoryAdapter(
+        BrainAdapterConfig.from_env()
+    )
+    owner_id = adapter._owner(
+        owner, adapter.config.default_owner
+    )
+    logger.debug(
+        "[brain-recall] event=brain_recall_started "
+        "owner=%s session_id=%s",
+        owner_id, session_id,
+    )
+    result = adapter.recall_for_prompt(
+        owner=owner,
+        query=query,
+        exclude_external_source_refs=(
+            exclude_external_source_refs
+        ),
+    )
+
+    if result.delivered and result.packet is not None:
+        packet = result.packet
+        selected = packet.get("selected") or []
+        ids = [
+            str(item.get("uuid"))
+            for item in selected
+            if isinstance(item, dict) and item.get("uuid")
+        ]
+        logger.debug(
+            "[brain-recall] event=brain_recall_candidates "
+            "owner=%s session_id=%s candidates=%s "
+            "semantic=%s episodic=%s vector_candidates=%s",
+            owner_id,
+            session_id,
+            packet.get("candidate_count", 0),
+            packet.get("eligible_semantic_count", 0),
+            packet.get("eligible_episode_count", 0),
+            packet.get("vector_candidate_count", 0),
+        )
+        logger.info(
+            "[brain-recall] event=brain_recall_selected "
+            "owner=%s session_id=%s selected=%s mode=%s "
+            "ids=%s chars=%s",
+            owner_id,
+            session_id,
+            packet.get("selected_count", 0),
+            packet.get("selection_mode", "none"),
+            ids,
+            packet.get("context_chars", 0),
+        )
+    elif result.attempted:
+        logger.warning(
+            "[brain-recall] event=brain_recall_error "
+            "owner=%s session_id=%s status=%s error=%s",
+            owner_id, session_id,
+            result.status_code, result.error,
+        )
+    elif result.error not in {
+        None, "disabled", "empty query"
+    }:
+        logger.warning(
+            "[brain-recall] event=brain_recall_skipped "
+            "owner=%s session_id=%s error=%s",
+            owner_id, session_id, result.error,
+        )
+    return result
 
 def shadow_persisted_message(**kwargs) -> ShadowCaptureResult:
     """Environment-configured one-shot shadow mirror.

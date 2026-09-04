@@ -1,10 +1,13 @@
 services:
   odysseus:
     environment:
-      ASSISTANT_BRAIN_MODE: shadow
+      ASSISTANT_BRAIN_MODE: recall
       JARVIS_BRAIN_URL: http://jarvis-brain:8765
       JARVIS_BRAIN_API_KEY: ${JARVIS_BRAIN_API_KEY}
       ASSISTANT_BRAIN_TIMEOUT_SECONDS: "0.75"
+      ASSISTANT_BRAIN_RECALL_TIMEOUT_SECONDS: "2.0"
+      ASSISTANT_BRAIN_RECALL_MAX_ITEMS: "6"
+      ASSISTANT_BRAIN_RECALL_MAX_CHARS: "2800"
       ASSISTANT_BRAIN_DEFAULT_OWNER: local
     volumes:
       - ./src:/app/src:ro,z

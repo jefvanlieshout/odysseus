@@ -252,12 +252,138 @@ class VectorSidecarTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(int(row[0]), 1)
 
+    def test_recall_context_is_bounded_and_provenance_rich(self):
+        obs, result = self.create_memory(
+            "jef", "recall-fish", "I use fish shell."
+        )
+        packet = self.brain.recall_context(
+            owner_id="jef",
+            query="Which fish shell do I use?",
+            max_chars=2200,
+        )
+        self.assertEqual(
+            packet["selection_mode"], "semantic"
+        )
+        self.assertGreaterEqual(
+            packet["selected_count"], 1
+        )
+        self.assertLessEqual(
+            packet["context_chars"], 2200
+        )
+        first = packet["selected"][0]
+        self.assertEqual(first["kind"], "semantic")
+        self.assertEqual(
+            first["uuid"], result.memory_uuid
+        )
+        self.assertEqual(first["revision_no"], 1)
+        self.assertTrue(first["provenance"])
+        self.assertEqual(
+            first["provenance"][0][
+                "external_source_ref"
+            ],
+            "recall-fish",
+        )
+        self.assertNotIn(
+            "raw_text", first["provenance"][0]
+        )
+        self.assertIn(
+            "vector_similarity",
+            first["retrieval"],
+        )
+
+    def test_recall_excludes_current_message_episode(self):
+        self.capture(
+            owner="jef",
+            ref="current-turn",
+            text="The turbo pump alarm happened just now.",
+        )
+        packet = self.brain.recall_context(
+            owner_id="jef",
+            query="turbo pump alarm",
+            exclude_external_source_refs=[
+                "current-turn"
+            ],
+        )
+        self.assertEqual(packet["selected_count"], 0)
+        self.assertEqual(packet["context"], "")
+
+    def test_recall_current_semantic_suppresses_old_episodes(self):
+        first_obs, first = self.create_memory(
+            "jef", "shell-old", "I use fish shell."
+        )
+        second_obs = self.capture(
+            owner="jef",
+            ref="shell-new",
+            text="I now use zsh shell instead of fish.",
+        )
+        candidate = SemanticCandidate(
+            content=(
+                "The user currently uses zsh "
+                "shell instead of fish."
+            ),
+            memory_type="fact",
+            scope="linux",
+            confidence=0.95,
+            evidence_uuid=second_obs[
+                "evidence_uuid"
+            ],
+            evidence_quote=(
+                "zsh shell instead of fish"
+            ),
+        )
+        updated = self.brain.commit_semantic_candidate(
+            owner_id="jef",
+            candidate=candidate,
+            decision=RelationDecision(
+                SemanticRelation.STATE_CHANGE,
+                first.memory_uuid,
+                0.99,
+                "shell changed",
+            ),
+            provenance=ProvenanceCheck(
+                candidate.content,
+                (
+                    ClaimStatus.SUPPORTED_PARAPHRASE,
+                ),
+            ),
+            idempotency_key="semantic-shell-new",
+        )
+        self.assertEqual(updated.revision_no, 2)
+
+        packet = self.brain.recall_context(
+            owner_id="jef",
+            query="What shell do I currently use?",
+        )
+        self.assertEqual(
+            packet["selection_mode"], "semantic"
+        )
+        self.assertTrue(packet["selected"])
+        self.assertIn(
+            "zsh",
+            packet["selected"][0][
+                "text"
+            ].casefold(),
+        )
+        self.assertEqual(
+            packet["selected"][0][
+                "revision_no"
+            ],
+            2,
+        )
+        self.assertFalse(
+            any(
+                item["kind"] == "episode"
+                for item in packet["selected"]
+            )
+        )
+
     def test_health_reports_vector_backend(self):
         health = self.brain.health()
         self.assertEqual(health["vector"], "healthy")
         self.assertEqual(health["vector_backend"], "ChromaVectorIndex")
         self.assertEqual(health["phase"], "semantic-worker-core")
         self.assertTrue(health["semantic_worker_core"])
+        self.assertTrue(health["brain_recall_core"])
 
 
     def test_collection_contract_mismatch_fails_closed(self):
@@ -334,6 +460,52 @@ class VectorSidecarTests(unittest.TestCase):
             self.assertTrue(body["hits"])
         finally:
             server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    def test_api_recall_is_authenticated_and_bounded(self):
+        key = "r"*40
+        self.create_memory(
+            owner="jef",
+            ref="api-recall-memory",
+            text="I use fish shell.",
+        )
+        server, thread = start_server_in_thread(
+            self.brain, key
+        )
+        try:
+            host, port = server.server_address
+            base = f"http://{host}:{port}"
+
+            status, _ = http_json(
+                base+"/v1/recall",
+                payload={
+                    "owner_id": "jef",
+                    "query": "fish shell",
+                },
+            )
+            self.assertEqual(status, 401)
+
+            status, body = http_json(
+                base+"/v1/recall",
+                key=key,
+                payload={
+                    "owner_id": "jef",
+                    "query": "fish shell",
+                    "max_items": 4,
+                    "max_chars": 1600,
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(body["ok"])
+            self.assertGreaterEqual(
+                body["selected_count"], 1
+            )
+            self.assertLessEqual(
+                body["context_chars"], 1600
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     def test_api_replay_conflict_is_409(self):
         key = "q"*40

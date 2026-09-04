@@ -137,6 +137,20 @@ class BrainAPIHandler(BaseHTTPRequestHandler):
                     ],
                 })
                 return
+            if path == "/v1/recall":
+                result = self.server.service.recall_context(
+                    owner_id=body.get("owner_id"),
+                    query=body.get("query"),
+                    candidate_limit=body.get("candidate_limit", 16),
+                    max_items=body.get("max_items", 6),
+                    max_chars=body.get("max_chars", 2800),
+                    include_episodes=body.get("include_episodes", True),
+                    exclude_external_source_refs=body.get(
+                        "exclude_external_source_refs"
+                    ),
+                )
+                self._json(HTTPStatus.OK, {"ok": True, **result})
+                return
             if path == "/v1/rebuild-index":
                 result = self.server.service.rebuild_vector_index(owner_id=body.get("owner_id"))
                 self._json(HTTPStatus.OK, {"ok": True, **result})

@@ -68,6 +68,7 @@ class BrainMemoryService:
             "llm_enabled": False,
             "phase": "semantic-worker-core",
             "semantic_worker_core": True,
+            "brain_recall_core": True,
         }
         identity = getattr(self.vector, "identity", None)
         if identity is not None:
@@ -848,9 +849,9 @@ class BrainMemoryService:
                 (owner_id,),
             ).fetchall():
                 text = str(row["current_content"])
-                score = lexical_score(query, f"{row['scope']} {row['memory_type']} {text}")
-                if score > 0:
-                    score += 0.35 if int(row["pinned"]) else 0.0
+                lexical = lexical_score(query, f"{row['scope']} {row['memory_type']} {text}")
+                if lexical > 0:
+                    score = lexical + (0.35 if int(row["pinned"]) else 0.0)
                     candidates[("semantic", str(row["uuid"]))] = SearchHit(
                         "semantic",
                         str(row["uuid"]),
@@ -862,6 +863,8 @@ class BrainMemoryService:
                             "confidence": row["confidence"],
                             "pinned": bool(row["pinned"]),
                             "updated_at": row["updated_at"],
+                            "lexical_score": round(lexical, 6),
+                            "vector_similarity": 0.0,
                         },
                     )
             if include_episodes:
@@ -872,8 +875,9 @@ class BrainMemoryService:
                     (owner_id,),
                 ).fetchall():
                     text = str(row["text"])
-                    score = lexical_score(query, f"{row['scope']} {text}")
-                    if score > 0:
+                    lexical = lexical_score(query, f"{row['scope']} {text}")
+                    if lexical > 0:
+                        score = lexical
                         if row["status"] == "archived":
                             score *= 0.72
                         score *= 0.85 + 0.15 * float(row["importance"])
@@ -888,6 +892,8 @@ class BrainMemoryService:
                                 "activation": row["activation"],
                                 "status": row["status"],
                                 "created_at": row["created_at"],
+                                "lexical_score": round(lexical, 6),
+                                "vector_similarity": 0.0,
                             },
                         )
 
@@ -909,12 +915,17 @@ class BrainMemoryService:
                         key = (kind, item_uuid)
                         hit = candidates.get(key)
                         if hit is not None:
+                            metadata = dict(hit.metadata)
+                            metadata["vector_similarity"] = max(
+                                float(metadata.get("vector_similarity", 0.0) or 0.0),
+                                similarity,
+                            )
                             candidates[key] = SearchHit(
                                 hit.kind,
                                 hit.uuid,
                                 hit.text,
                                 round(hit.score + similarity * 4.0, 6),
-                                hit.metadata,
+                                metadata,
                             )
                             continue
 
@@ -938,6 +949,8 @@ class BrainMemoryService:
                                         "confidence": row["confidence"],
                                         "pinned": bool(row["pinned"]),
                                         "updated_at": row["updated_at"],
+                                        "lexical_score": 0.0,
+                                        "vector_similarity": round(similarity, 6),
                                     },
                                 )
                         else:
@@ -964,6 +977,8 @@ class BrainMemoryService:
                                         "activation": row["activation"],
                                         "status": row["status"],
                                         "created_at": row["created_at"],
+                                        "lexical_score": 0.0,
+                                        "vector_similarity": round(similarity, 6),
                                     },
                                 )
         except Exception as exc:
@@ -982,6 +997,273 @@ class BrainMemoryService:
                 (new_uuid(), owner_id, query, len(hits), 1 if vector_used else 0, utc_now()),
             )
         return hits
+
+    def recall_context(
+        self,
+        *,
+        owner_id: str,
+        query: str,
+        candidate_limit: int = 16,
+        max_items: int = 6,
+        max_chars: int = 2800,
+        include_episodes: bool = True,
+        exclude_external_source_refs: Iterable[str] | None = None,
+    ) -> dict:
+        # Bounded, provenance-rich recall from authoritative SQLite state.
+        owner_id = self._require_text(owner_id, "owner_id")
+        query = self._require_text(query, "query")
+        candidate_limit = max(4, min(int(candidate_limit), 40))
+        max_items = max(1, min(int(max_items), 8))
+        max_chars = max(512, min(int(max_chars), 8000))
+
+        if exclude_external_source_refs is None:
+            excluded_refs: set[str] = set()
+        else:
+            if isinstance(exclude_external_source_refs, (str, bytes)):
+                raise ValueError(
+                    "exclude_external_source_refs must be a sequence, not a string"
+                )
+            excluded_refs = {
+                str(value).strip()
+                for value in exclude_external_source_refs
+                if str(value or "").strip()
+            }
+            if len(excluded_refs) > 16:
+                raise ValueError("too many excluded external source refs")
+
+        hits = self.search(
+            owner_id=owner_id,
+            query=query,
+            limit=candidate_limit,
+            include_episodes=include_episodes,
+        )
+
+        semantic_records: list[dict] = []
+        episode_records: list[dict] = []
+
+        with self.store.read() as db:
+            for hit in hits:
+                metadata = dict(hit.metadata or {})
+                try:
+                    lexical = max(
+                        0.0,
+                        float(metadata.get("lexical_score", 0.0) or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    lexical = 0.0
+                try:
+                    vector_similarity = max(
+                        0.0,
+                        min(
+                            float(
+                                metadata.get("vector_similarity", 0.0) or 0.0
+                            ),
+                            1.0,
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    vector_similarity = 0.0
+
+                if hit.kind == "semantic":
+                    if lexical < 1.5 and vector_similarity < 0.58:
+                        continue
+
+                    row = db.execute(
+                        "SELECT m.id AS memory_id, m.status, m.memory_type, "
+                        "m.scope, m.confidence, m.pinned, "
+                        "r.id AS revision_id, r.uuid AS revision_uuid, "
+                        "r.revision_no "
+                        "FROM semantic_memories m "
+                        "JOIN memory_revisions r ON r.memory_id=m.id "
+                        "WHERE m.owner_id=? AND m.uuid=? "
+                        "AND m.status='current' "
+                        "ORDER BY r.revision_no DESC LIMIT 1",
+                        (owner_id, hit.uuid),
+                    ).fetchone()
+                    if row is None:
+                        continue
+
+                    evidence_rows = db.execute(
+                        "SELECT e.uuid AS evidence_uuid, e.source_kind, "
+                        "e.external_source_ref, e.session_id, e.occurred_at "
+                        "FROM revision_evidence re "
+                        "JOIN evidence e ON e.id=re.evidence_id "
+                        "WHERE re.revision_id=? AND e.owner_id=? "
+                        "ORDER BY e.occurred_at DESC, e.id DESC LIMIT 4",
+                        (int(row["revision_id"]), owner_id),
+                    ).fetchall()
+                    provenance = [
+                        {
+                            "evidence_uuid": str(e["evidence_uuid"]),
+                            "source_kind": str(e["source_kind"]),
+                            "external_source_ref": e["external_source_ref"],
+                            "session_id": e["session_id"],
+                            "occurred_at": str(e["occurred_at"]),
+                        }
+                        for e in evidence_rows
+                    ]
+
+                    if excluded_refs and any(
+                        str(item.get("external_source_ref") or "")
+                        in excluded_refs
+                        for item in provenance
+                    ):
+                        continue
+
+                    pinned = bool(row["pinned"])
+                    rank_score = (
+                        float(hit.score) + 0.80 + (0.20 if pinned else 0.0)
+                    )
+                    semantic_records.append({
+                        "kind": "semantic",
+                        "uuid": hit.uuid,
+                        "text": hit.text,
+                        "score": round(float(hit.score), 6),
+                        "rank_score": round(rank_score, 6),
+                        "retrieval": {
+                            "lexical_score": round(lexical, 6),
+                            "vector_similarity": round(
+                                vector_similarity, 6
+                            ),
+                        },
+                        "memory_type": str(row["memory_type"]),
+                        "scope": str(row["scope"]),
+                        "confidence": float(row["confidence"]),
+                        "status": "current",
+                        "current": True,
+                        "revision_no": int(row["revision_no"]),
+                        "revision_uuid": str(row["revision_uuid"]),
+                        "provenance": provenance,
+                    })
+                    continue
+
+                if hit.kind != "episode" or not include_episodes:
+                    continue
+                if lexical < 2.0 and vector_similarity < 0.68:
+                    continue
+
+                row = db.execute(
+                    "SELECT ep.status, ep.scope, ep.importance, "
+                    "ep.activation, ep.created_at, "
+                    "e.uuid AS evidence_uuid, e.source_kind, "
+                    "e.external_source_ref, e.session_id, e.occurred_at "
+                    "FROM episodes ep "
+                    "JOIN evidence e ON e.id=ep.evidence_id "
+                    "WHERE ep.owner_id=? AND ep.uuid=? AND e.owner_id=?",
+                    (owner_id, hit.uuid, owner_id),
+                ).fetchone()
+                if row is None:
+                    continue
+
+                external_ref = str(row["external_source_ref"] or "")
+                if external_ref and external_ref in excluded_refs:
+                    continue
+
+                status = str(row["status"])
+                if (
+                    status == "archived"
+                    and lexical < 3.0
+                    and vector_similarity < 0.75
+                ):
+                    continue
+
+                importance = float(row["importance"])
+                activation = float(row["activation"])
+                rank_score = (
+                    float(hit.score)
+                    + 0.20 * importance
+                    + 0.10 * activation
+                )
+                episode_records.append({
+                    "kind": "episode",
+                    "uuid": hit.uuid,
+                    "text": hit.text,
+                    "score": round(float(hit.score), 6),
+                    "rank_score": round(rank_score, 6),
+                    "retrieval": {
+                        "lexical_score": round(lexical, 6),
+                        "vector_similarity": round(vector_similarity, 6),
+                    },
+                    "scope": str(row["scope"]),
+                    "importance": importance,
+                    "activation": activation,
+                    "status": status,
+                    "current": False,
+                    "provenance": [{
+                        "evidence_uuid": str(row["evidence_uuid"]),
+                        "source_kind": str(row["source_kind"]),
+                        "external_source_ref": row["external_source_ref"],
+                        "session_id": row["session_id"],
+                        "occurred_at": str(row["occurred_at"]),
+                    }],
+                })
+
+        semantic_records.sort(
+            key=lambda item: (item["rank_score"], item["uuid"]),
+            reverse=True,
+        )
+        episode_records.sort(
+            key=lambda item: (item["rank_score"], item["uuid"]),
+            reverse=True,
+        )
+
+        # Current semantic truth is primary. Episodic history is fallback.
+        eligible = semantic_records if semantic_records else episode_records
+        selection_mode = (
+            "semantic"
+            if semantic_records
+            else ("episodic" if episode_records else "none")
+        )
+
+        selected: list[dict] = []
+        for record in eligible[:max_items]:
+            proposed = [*selected, record]
+            encoded = json.dumps(
+                {
+                    "brain_recall_version": "0.4.0",
+                    "selection_mode": selection_mode,
+                    "records": proposed,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if len(encoded) <= max_chars:
+                selected.append(record)
+
+        context = ""
+        if selected:
+            context = json.dumps(
+                {
+                    "brain_recall_version": "0.4.0",
+                    "selection_mode": selection_mode,
+                    "records": selected,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+
+        return {
+            "candidate_count": len(hits),
+            "eligible_semantic_count": len(semantic_records),
+            "eligible_episode_count": len(episode_records),
+            "selected_count": len(selected),
+            "selection_mode": selection_mode,
+            "selected": selected,
+            "context": context,
+            "context_chars": len(context),
+            "budget_chars": max_chars,
+            "vector_candidate_count": sum(
+                1
+                for hit in hits
+                if float(
+                    (hit.metadata or {}).get(
+                        "vector_similarity", 0.0
+                    ) or 0.0
+                ) > 0.0
+            ),
+        }
 
     def _ensure_session(self, db, owner_id: str, external_session_ref: str, *, now: str) -> tuple[int, str]:
         row = db.execute(

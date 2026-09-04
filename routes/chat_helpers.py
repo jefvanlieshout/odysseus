@@ -699,6 +699,62 @@ async def build_chat_context(
     if is_research_spinoff:
         mem_enabled = False
 
+    # Brain v0.4 recall: one read for the newly persisted user turn.
+    brain_recall_result = None
+    if (
+        mem_enabled
+        and persist_user_message
+        and str(context_message or "").strip()
+    ):
+        current_message_ref = None
+        try:
+            latest = (
+                getattr(sess, "history", None) or []
+            )[-1]
+            latest_role = getattr(
+                latest, "role", None
+            )
+            latest_meta = getattr(
+                latest, "metadata", None
+            )
+            if (
+                latest_role == "user"
+                and isinstance(latest_meta, dict)
+            ):
+                current_message_ref = (
+                    str(
+                        latest_meta.get("_db_id") or ""
+                    ).strip()
+                    or None
+                )
+        except Exception:
+            current_message_ref = None
+
+        try:
+            from assistant.fork.brain_adapter import (
+                brain_recall_for_prompt,
+            )
+            brain_recall_result = await asyncio.to_thread(
+                brain_recall_for_prompt,
+                owner=getattr(sess, "owner", None),
+                session_id=session_id,
+                query=context_message,
+                exclude_external_source_refs=(
+                    [current_message_ref]
+                    if current_message_ref
+                    else []
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "[brain-recall] "
+                "event=brain_recall_error "
+                "session_id=%s "
+                "error=unexpected_adapter_failure",
+                session_id,
+                exc_info=True,
+            )
+
     # Use RAG?
     use_rag_val = (str(use_rag).lower() != "false") if use_rag is not None else True
     if incognito or not allow_tool_preprocessing or is_research_spinoff or casual_low_signal:
@@ -761,6 +817,43 @@ async def build_chat_context(
     # history: the session id may be a temporary wrapper or, in buggy clients, a
     # stale normal session id. Only the ephemeral incognito transcript is safe.
     messages = preface + (_incognito_messages(session_id) if incognito else sess.get_context_messages())
+
+    # Brain recall is untrusted reference data and is never
+    # appended to sess.history.
+    if (
+        brain_recall_result is not None
+        and brain_recall_result.delivered
+    ):
+        packet = brain_recall_result.packet or {}
+        recall_context = packet.get("context")
+        if (
+            isinstance(recall_context, str)
+            and recall_context
+        ):
+            recall_message = untrusted_context_message(
+                "Jarvis Brain recall",
+                recall_context,
+                provenance_origin="jarvis-brain",
+                arm_tool_gate=True,
+            )
+            if (
+                messages
+                and messages[-1].get("role") == "user"
+            ):
+                messages.insert(
+                    len(messages) - 1,
+                    recall_message,
+                )
+            else:
+                messages.append(recall_message)
+            logger.info(
+                "[brain-recall] "
+                "event=brain_recall_injected "
+                "session_id=%s selected=%s chars=%s",
+                session_id,
+                packet.get("selected_count", 0),
+                packet.get("context_chars", 0),
+            )
 
     # Current date/time — injected as a standalone *user*-role context message
     # placed immediately before the latest user turn, NOT folded into the

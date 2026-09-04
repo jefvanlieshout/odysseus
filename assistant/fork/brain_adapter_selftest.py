@@ -17,7 +17,9 @@ sys.path.insert(0, str(ROOT))
 from assistant.fork.brain_adapter import (
     BrainAdapterConfig,
     BrainMemoryAdapter,
+    BrainRecallResult,
     ShadowCaptureResult,
+    brain_recall_for_prompt,
     shadow_persisted_message,
 )
 
@@ -135,6 +137,84 @@ def main() -> None:
             assert server.requests[-1]["path"] == "/v1/capture/message"
             assert server.requests[-1]["body"]["role"] == role
 
+        # Recall mode preserves capture + adds bounded reads.
+        server.reply_status = 200
+        server.reply_payload = {
+            "ok": True,
+            "candidate_count": 3,
+            "eligible_semantic_count": 1,
+            "eligible_episode_count": 1,
+            "selected_count": 1,
+            "selection_mode": "semantic",
+            "selected": [{
+                "kind": "semantic",
+                "uuid": "memory-1",
+                "text": "The user uses fish shell.",
+            }],
+            "context": (
+                '{"brain_recall_version":"0.4.0",'
+                '"records":[]}'
+            ),
+            "context_chars": 48,
+            "budget_chars": 2800,
+            "vector_candidate_count": 2,
+        }
+        recall_adapter = BrainMemoryAdapter(
+            _config(server, mode="recall")
+        )
+        recall = recall_adapter.recall_for_prompt(
+            owner="jef",
+            query="Which shell do I use?",
+            exclude_external_source_refs=(
+                "current-message",
+            ),
+        )
+        assert isinstance(recall, BrainRecallResult)
+        assert recall.attempted and recall.delivered
+        request = server.requests[-1]
+        assert request["path"] == "/v1/recall"
+        assert (
+            request["body"][
+                "exclude_external_source_refs"
+            ]
+            == ["current-message"]
+        )
+
+        before_recall = len(server.requests)
+        shadow_only = BrainMemoryAdapter(
+            _config(server, mode="shadow")
+        )
+        skipped = shadow_only.recall_for_prompt(
+            owner="jef",
+            query="remember this?",
+        )
+        assert not skipped.attempted
+        assert len(server.requests) == before_recall
+
+        server.reply_payload = {
+            "ok": True,
+            "candidate_count": 1,
+            "eligible_semantic_count": 1,
+            "eligible_episode_count": 0,
+            "selected_count": 1,
+            "selection_mode": "semantic",
+            "selected": [],
+            "context": "x" * 3000,
+            "context_chars": 3000,
+            "budget_chars": 2800,
+            "vector_candidate_count": 1,
+        }
+        oversized = recall_adapter.recall_for_prompt(
+            owner="jef",
+            query="oversized",
+        )
+        assert oversized.attempted
+        assert not oversized.delivered
+        assert "budget" in (oversized.error or "")
+
+        server.reply_status = 200
+        server.reply_payload = {"ok": True}
+
         # Disabled mode performs no network I/O.
         before = len(server.requests)
         off = BrainMemoryAdapter(_config(server, mode="off"))
@@ -223,6 +303,35 @@ def main() -> None:
         assert "message.metadata['_db_id'] = msg_id" in body
         assert body.rindex("db.close()") < body.index("shadow_persisted_message")
         assert body.index("db.commit()") < body.index("shadow_persisted_message")
+
+        # Recall hook is ephemeral and prompt-sandboxed.
+        chat_source = (
+            ROOT / "routes" / "chat_helpers.py"
+        ).read_text(encoding="utf-8")
+        build_start = chat_source.index(
+            "async def build_chat_context("
+        )
+        build_end = chat_source.index(
+            "\ndef accumulate_token_usage(",
+            build_start,
+        )
+        build_body = chat_source[
+            build_start:build_end
+        ]
+        assert "brain_recall_for_prompt" in build_body
+        assert "await asyncio.to_thread(" in build_body
+        assert "current_message_ref" in build_body
+        assert '"Jarvis Brain recall"' in build_body
+        assert (
+            'provenance_origin="jarvis-brain"'
+            in build_body
+        )
+        assert "brain_recall_injected" in build_body
+        assert build_body.index(
+            '"Jarvis Brain recall"'
+        ) < build_body.index(
+            "route_messages = list(messages)"
+        )
 
         print("Brain shadow adapter contracts: PASS")
     finally:
