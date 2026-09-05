@@ -35,6 +35,83 @@ from src.upload_limits import read_upload_limited, MEMORY_IMPORT_MAX_BYTES
 logger = logging.getLogger(__name__)
 
 
+def _memory_backend_for_owner(owner: Optional[str]) -> str:
+    """Return the controller-owned memory backend preference."""
+    try:
+        from routes.prefs_routes import _load_for_user
+        prefs = _load_for_user(owner)
+    except Exception:
+        logger.warning("Could not load memory backend preference for memory UI", exc_info=True)
+        return "native"
+    return str(prefs.get("memory_backend", "native") or "native").strip().casefold()
+
+
+def _require_native_memory_write(owner: Optional[str]) -> None:
+    # Block native memory mutations while Brain is authoritative.
+    if _memory_backend_for_owner(owner) == "brain":
+        raise HTTPException(
+            409,
+            "Brain is the authoritative memory backend. "
+            "The Odysseus memory panel is read-only in Brain mode.",
+        )
+
+
+def _brain_timestamp(value: Any) -> int:
+    """Best-effort conversion of Brain timestamp fields to unix seconds."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str) or not value.strip():
+        return 0
+    raw = value.strip()
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        pass
+    try:
+        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        return int(datetime.fromisoformat(normalized).timestamp())
+    except (TypeError, ValueError, OSError, OverflowError):
+        return 0
+
+
+def _brain_memory_to_ui(memory: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a Brain semantic memory to the stable shape expected by memory.js."""
+    memory_uuid = str(memory.get("uuid") or memory.get("memory_uuid") or memory.get("id") or "")
+    text = str(memory.get("current_content") or memory.get("content") or memory.get("text") or "")
+    memory_type = str(memory.get("memory_type") or memory.get("type") or "fact").strip().casefold()
+    memory_type = re.sub(r"[^a-z0-9_-]+", "-", memory_type).strip("-") or "fact"
+
+    timestamp = 0
+    for key in ("updated_at", "last_updated_at", "created_at", "timestamp"):
+        timestamp = _brain_timestamp(memory.get(key))
+        if timestamp:
+            break
+
+    revision = (
+        memory.get("revision_no")
+        or memory.get("revision")
+        or memory.get("current_revision")
+        or memory.get("revision_count")
+    )
+    confidence = memory.get("confidence")
+    if confidence is None:
+        confidence = memory.get("support_score")
+
+    return {
+        "id": memory_uuid,
+        "text": text,
+        "category": memory_type,
+        "source": "brain",
+        "uses": int(memory.get("uses") or memory.get("recall_count") or 0),
+        "timestamp": timestamp,
+        "pinned": False,
+        "brain_uuid": memory_uuid,
+        "brain_status": str(memory.get("status") or "current"),
+        "brain_revision": revision,
+        "brain_confidence": confidence,
+    }
+
+
 def _load_for_update(memory_manager) -> List[Dict[str, Any]]:
     """Load the whole store for a read-modify-write cycle.
 
@@ -115,6 +192,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             )
 
         user = _owner(request)
+        _require_native_memory_write(user)
         text = (memory_data.text or "").strip()
         if not text:
             raise HTTPException(400, "empty memory")
@@ -147,9 +225,49 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
 
     @router.get("")
     def api_get_memory(request: Request):
-        """Return all memory entries with their metadata."""
+        """Return memories from the configured authoritative backend.
+
+        Brain mode is intentionally read-only in the Odysseus UI. Brain remains
+        the source of truth; no semantic memory is copied into native storage.
+        """
         user = _owner(request)
-        return {"memory": memory_manager.load(owner=user)}
+        backend = _memory_backend_for_owner(user)
+
+        if backend == "brain":
+            try:
+                from assistant.fork.brain_adapter import brain_manage_memory
+                result = brain_manage_memory(owner=user, session_id=None, content="list")
+            except Exception:
+                logger.exception("Brain memory UI list failed")
+                raise HTTPException(503, "Brain memory service is unavailable.")
+
+            if result.get("error"):
+                logger.warning("Brain memory UI list rejected: %s", result.get("error"))
+                raise HTTPException(503, "Brain memory service is unavailable.")
+
+            raw_memories = result.get("memories") or []
+            if not isinstance(raw_memories, list):
+                logger.error("Brain memory UI returned non-list memories payload")
+                raise HTTPException(502, "Brain returned an invalid memory list.")
+
+            visible = [
+                _brain_memory_to_ui(item)
+                for item in raw_memories
+                if isinstance(item, dict)
+            ]
+            return {
+                "memory": visible,
+                "backend": "brain",
+                "authority": "brain",
+                "read_only": True,
+            }
+
+        return {
+            "memory": memory_manager.load(owner=user),
+            "backend": "native",
+            "authority": "native",
+            "read_only": False,
+        }
 
     @router.post("/search")
     def search_memories(request: Request, query: str = Form(...), session_id: str = Form(None), category: str = Form(None)):
@@ -294,6 +412,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         Returns before and after memory counts.
         """
         user = _owner(request)
+        _require_native_memory_write(user)
         fallback_url = fallback_model = None
         fallback_headers = None
         if session:
@@ -503,6 +622,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
     def pin_memory(request: Request, memory_id: str, pinned: bool = Form(True)):
         """Pin or unpin a memory. Pinned memories are always included in context."""
         user = _owner(request)
+        _require_native_memory_write(user)
         all_mem = _load_for_update(memory_manager)
         for i, memory in enumerate(all_mem):
             if memory["id"] == memory_id:
@@ -528,6 +648,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
     def update_memory(request: Request, memory_id: str, text: str = Form(...), category: str = Form(None)):
         """Update an existing memory item with new text and optional category."""
         user = _owner(request)
+        _require_native_memory_write(user)
         all_mem = _load_for_update(memory_manager)
         for i, memory in enumerate(all_mem):
             if memory["id"] == memory_id:
@@ -550,6 +671,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
     def delete_memory(request: Request, memory_id: str):
         """Delete a memory item by its ID."""
         user = _owner(request)
+        _require_native_memory_write(user)
         all_mem = _load_for_update(memory_manager)
 
         # Find and verify ownership before deleting

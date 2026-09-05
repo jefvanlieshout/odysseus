@@ -16,9 +16,43 @@ let sortOrder = 'newest';
 let selectMode = false;
 let selectedIds = new Set();
 let memoriesLoading = false;
+let memoryBackend = 'native';
+let memoryReadOnly = false;
 
 
 const MEMORY_CATEGORIES = ['fact', 'identity', 'preference', 'contact', 'project', 'goal', 'task'];
+
+function _brainViewerActive() {
+  return memoryBackend === 'brain' && memoryReadOnly;
+}
+
+function applyMemoryBackendMode() {
+  const brainView = _brainViewerActive();
+
+  const selectBtn = document.getElementById('memory-select-btn');
+  const tidyBtn = document.getElementById('memory-tidy-btn');
+  const bulkBar = document.getElementById('memory-bulk-bar');
+  const addTab = document.querySelector('.memory-tab[data-memory-tab="add"]');
+
+  if (selectBtn) {
+    selectBtn.disabled = brainView;
+    selectBtn.style.display = brainView ? 'none' : '';
+  }
+  if (tidyBtn) {
+    tidyBtn.disabled = brainView;
+    tidyBtn.style.display = brainView ? 'none' : '';
+  }
+  if (bulkBar && brainView) bulkBar.classList.add('hidden');
+  if (addTab) {
+    addTab.style.display = brainView ? 'none' : '';
+    addTab.setAttribute('aria-disabled', brainView ? 'true' : 'false');
+    if (brainView && addTab.classList.contains('active')) {
+      document.querySelector('.memory-tab:not([data-memory-tab="add"])')?.click();
+    }
+  }
+
+  if (brainView && selectMode) exitSelectMode();
+}
 
 // Sort-option icons for the custom Memory sort picker (and Skills picker
 // once it reuses the same markup). Each value maps to a 13px Feather-style
@@ -200,12 +234,19 @@ async function syncToggles() {
   const headerToggle = document.getElementById('memory-enabled-header-toggle');
   if (headerToggle) {
     const modalBody = document.querySelector('.memory-modal-body');
-    if (modalBody) modalBody.style.opacity = headerToggle.checked ? '' : '0.3';
+    const applyMemoryDim = () => {
+      if (modalBody) {
+        modalBody.style.opacity = _brainViewerActive()
+          ? ''
+          : (headerToggle.checked ? '' : '0.3');
+      }
+    };
+    applyMemoryDim();
     reflectMemoryToggleInSidebar(headerToggle.checked);
     if (!headerToggle.dataset.boundUx) {
       headerToggle.dataset.boundUx = '1';
       headerToggle.addEventListener('change', () => {
-        if (modalBody) modalBody.style.opacity = headerToggle.checked ? '' : '0.3';
+        applyMemoryDim();
         reflectMemoryToggleInSidebar(headerToggle.checked);
       });
     }
@@ -398,7 +439,11 @@ export async function loadMemories() {
       memories = [];
     }
 
+    memoryBackend = (data && data.backend) ? String(data.backend) : 'native';
+    memoryReadOnly = Boolean(data && data.read_only);
+
     memoriesLoading = false;
+    applyMemoryBackendMode();
     buildCategoryChips();
     renderMemoryList();
     updateMemoryCount();
@@ -706,6 +751,11 @@ export function renderMemoryList() {
     const _smiley = '<span style="vertical-align:-3px;margin-left:6px;">' + uiModule.emptyStateIcon('smiley') + '</span>';
     if (searchTerm || activeCategory !== 'all') {
       memoryList.innerHTML = `<div class="memory-empty">No matches.</div>`;
+    } else if (_brainViewerActive()) {
+      memoryList.innerHTML = `<div class="memory-empty" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;">
+        <span>No Brain memories yet${_smiley}</span>
+        <span style="opacity:0.7;font-size:11px;display:block;">Brain is the read-only memory authority.</span>
+      </div>`;
     } else {
       memoryList.innerHTML = `<div class="memory-empty" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;">
         <span>No memories yet${_smiley}</span>
@@ -722,7 +772,7 @@ export function renderMemoryList() {
   }
 
   const selectBtn = document.getElementById('memory-select-btn');
-  if (selectBtn) selectBtn.disabled = false;
+  if (selectBtn) selectBtn.disabled = memoryReadOnly;
 
   filtered.forEach(memory => {
     const item = document.createElement('div');
@@ -775,8 +825,33 @@ export function renderMemoryList() {
 
     const srcSpan = document.createElement('span');
     srcSpan.className = 'memory-item-source';
-    srcSpan.textContent = memory.source === 'auto' ? 'auto' : 'manual';
+    srcSpan.textContent = memory.source === 'brain'
+      ? 'Brain'
+      : (memory.source === 'auto' ? 'auto' : 'manual');
     meta.appendChild(srcSpan);
+
+    if (memory.source === 'brain') {
+      if (memory.brain_status) {
+        const statusSpan = document.createElement('span');
+        statusSpan.className = 'memory-item-source';
+        statusSpan.textContent = String(memory.brain_status);
+        meta.appendChild(statusSpan);
+      }
+      if (memory.brain_revision !== null && memory.brain_revision !== undefined && memory.brain_revision !== '') {
+        const revisionSpan = document.createElement('span');
+        revisionSpan.className = 'memory-item-source';
+        revisionSpan.textContent = `rev ${memory.brain_revision}`;
+        meta.appendChild(revisionSpan);
+      }
+      const confidence = Number(memory.brain_confidence);
+      if (Number.isFinite(confidence) && confidence > 0) {
+        const confidenceSpan = document.createElement('span');
+        confidenceSpan.className = 'memory-item-source';
+        confidenceSpan.textContent = `${Math.round(confidence * 100)}%`;
+        confidenceSpan.title = 'Brain confidence/support score';
+        meta.appendChild(confidenceSpan);
+      }
+    }
 
     const uses = Number(memory.uses || 0);
     if (uses > 0) {
@@ -802,8 +877,8 @@ export function renderMemoryList() {
 
     item.appendChild(content);
 
-    // Double-click text to edit (not in select mode)
-    if (!selectMode) {
+    // Double-click text to edit (not in select mode or read-only Brain view)
+    if (!selectMode && !memoryReadOnly) {
       textSpan.addEventListener('dblclick', (e) => {
         e.stopPropagation();
         startInlineEdit(item, memory);
@@ -811,8 +886,8 @@ export function renderMemoryList() {
       textSpan.style.cursor = 'text';
     }
 
-    // Menu button (hidden in select mode)
-    if (!selectMode) {
+    // Menu button (hidden in select mode and read-only Brain view)
+    if (!selectMode && !memoryReadOnly) {
       const menuBtn = document.createElement('button');
       menuBtn.className = 'memory-menu-btn';
       menuBtn.innerHTML = '\u22EE';
