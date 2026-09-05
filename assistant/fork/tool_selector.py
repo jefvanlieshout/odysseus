@@ -14,6 +14,7 @@ This keeps selection explainable:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Iterable, Mapping, Sequence
 
 from assistant.fork.tool_broker import ToolCandidate
@@ -47,6 +48,43 @@ def _record_domain_caps(record: ToolRecord | None) -> set[str]:
         for cap in record.capabilities
         if cap.startswith("domain:")
     }
+
+
+def explicitly_named_candidate_tools(
+    text: str,
+    candidate_names: Iterable[str],
+) -> set[str]:
+    """Return already-retrieved tools explicitly named by the user.
+
+    This is a precision signal layered on top of semantic retrieval. It never
+    discovers or grants a new tool. Names are normalized only across ordinary
+    separators, so ``api_call`` matches "api call" while ``manage_tasks`` does
+    not match the generic word "tasks".
+    """
+    normalized_text = " " + re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        str(text or "").casefold(),
+    ).strip() + " "
+    if normalized_text == "  ":
+        return set()
+
+    matched: set[str] = set()
+    for raw_name in candidate_names:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        leaf = name.split("__", 2)[-1] if name.startswith("mcp__") else name
+        phrase = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            leaf.casefold(),
+        ).strip()
+        if len(phrase) < 3:
+            continue
+        if f" {phrase} " in normalized_text:
+            matched.add(name)
+    return matched
 
 
 def _signal(
@@ -152,6 +190,8 @@ def build_candidate_plan(
     # final authority.  Typed domains softly demote *known unrelated* domain
     # candidates, letting the prompt budget remove obvious cross-topic noise.
     for name in sorted(current):
+        if name in forced:
+            continue
         record = records.get(name)
         record_domains = _record_domain_caps(record)
         if suggested_domains:

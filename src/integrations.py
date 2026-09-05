@@ -142,6 +142,18 @@ INTEGRATION_PRESETS: Dict[str, Dict[str, Any]] = {
             "  that must be decrypted client-side with the user's master key."
         ),
     },
+    "proxmox": {
+        "name": "Proxmox VE",
+        "auth_type": "header",
+        "auth_header": "Authorization",
+        "description": (
+            "Proxmox VE read-only monitoring integration. Use the dedicated "
+            "proxmox tool for node, guest, storage, task, and diagnostic views. "
+            "Base URL: https://HOST:8006 (without /api2/json). API key value: "
+            "PVEAPIToken=user@realm!tokenid=SECRET. Use a privilege-separated "
+            "PVEAuditor token. Non-GET generic api_call requests are blocked."
+        ),
+    },
     "freshrss": {
         "name": "FreshRSS",
         "auth_type": "header",
@@ -529,6 +541,14 @@ async def execute_api_call(
     # (e.g. "http://host/v1/" → "http://host"). The integration's preset
     # endpoints include the full path, so the base should be bare.
     preset = (integration.get("preset") or integration.get("name", "")).lower()
+
+    is_proxmox = preset == "proxmox" or "proxmox" in str(integration.get("name") or "").casefold()
+    if is_proxmox and str(method or "").upper() != "GET":
+        return {
+            "error": "Proxmox integration is read-only: only GET requests are allowed.",
+            "exit_code": 1,
+        }
+
     strip_suffixes = {
         "miniflux": ["/v1"],
         "gitea": ["/api/v1", "/api"],

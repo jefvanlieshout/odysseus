@@ -22,6 +22,7 @@ from src.tools.cookbook import (  # noqa: F401
 )
 from src.tools.search import do_search_chats  # noqa: F401
 from src.tools.code_inspection import do_inspect_code  # noqa: F401
+from src.tools.proxmox import do_proxmox  # noqa: F401
 from src.tools.notes import do_manage_notes  # noqa: F401
 from src.tools.calendar import do_manage_calendar  # noqa: F401
 from src.tools.image import do_edit_image  # noqa: F401

@@ -16,6 +16,38 @@ PGID="${PGID:-1000}"
 GOSU_BIN="$(command -v gosu)"
 PYTHON_BIN="$(command -v python)"
 
+# Optional local/private CA trust.
+#
+# Drop extra public CA certificates under /app/data/ca-certificates/*.crt.
+# /app/data is already a persistent host bind mount, so this survives image
+# rebuilds without baking private-network trust anchors into the image.
+#
+# The entrypoint is still root here, which is the correct time to update the
+# system CA bundle. Uvicorn is started only after gosu drops privileges.
+ODYSSEUS_EXTRA_CA_DIR="${ODYSSEUS_EXTRA_CA_DIR:-/app/data/ca-certificates}"
+if [ -d "$ODYSSEUS_EXTRA_CA_DIR" ]; then
+    ca_changed=0
+    for ca_file in "$ODYSSEUS_EXTRA_CA_DIR"/*.crt; do
+        [ -f "$ca_file" ] || continue
+        ca_name="$(basename "$ca_file")"
+        ca_target="/usr/local/share/ca-certificates/$ca_name"
+
+        if [ ! -f "$ca_target" ] || ! cmp -s "$ca_file" "$ca_target"; then
+            install -m 0644 "$ca_file" "$ca_target"
+            ca_changed=1
+        fi
+    done
+
+    if [ "$ca_changed" -eq 1 ]; then
+        update-ca-certificates >/dev/null
+    fi
+fi
+
+# httpx defaults to certifi unless SSL_CERT_FILE / SSL_CERT_DIR tells it to use
+# another trust store. Point it at Debian's system bundle, which contains the
+# normal public roots plus any extra CA installed above.
+export SSL_CERT_FILE="${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}"
+
 # Reuse an existing matching group/user if the host's UID/GID already
 # corresponds to one in /etc/passwd (e.g. when the image is rebuilt
 # and "odysseus" already exists at the same id). Otherwise create.

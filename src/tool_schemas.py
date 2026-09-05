@@ -699,6 +699,25 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "proxmox",
+            "description": "Read-only Proxmox VE monitoring. Inspect nodes, VMs/LXCs, guest status/config, storage, tasks, or diagnostics. Never starts, stops, reboots, snapshots, or deletes anything.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "nodes", "guests", "guest_status", "guest_config", "storages", "tasks", "diagnostics"]
+                    },
+                    "guest": {"type": "string", "description": "VMID or guest name for guest_status / guest_config"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum recent tasks"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ask_teacher",
             "description": "Ask a more capable AI model for help when stuck on a difficult problem. The teacher provides guidance that can be saved as a learned skill.",
             "parameters": {

@@ -114,6 +114,12 @@ _register(
     result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
 )
 _register(
+    {"proxmox"},
+    ToolEffect.READ_PRIVATE,
+    ToolEffect.NETWORK_EGRESS,
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
+_register(
     {
         "list_email_accounts",
         "list_emails",

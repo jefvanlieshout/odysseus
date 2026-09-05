@@ -563,8 +563,9 @@ _DOMAIN_RULES = {
 - Do NOT use `manage_memory` for contact lookups — contact details live in the address book, not memory.""",
     "integrations": """\
 ## Integration/API rules
-- To query or control a configured service integration (Home Assistant, Miniflux, Gitea, Linkding, Jellyfin, or any other registered service), use `api_call` with the integration name, HTTP method, path, and optional JSON body.
-- Do not use shell, curl, or `app_api` to reach a user's connected integration when `api_call` is available.""",
+- For Proxmox VE status, guests, storage, tasks, or diagnostics, use the dedicated read-only `proxmox` tool.
+- To query or control another configured service integration (Home Assistant, Miniflux, Gitea, Linkding, Jellyfin, or any other registered service), use `api_call` with the integration name, HTTP method, path, and optional JSON body.
+- Do not use shell, curl, or `app_api` to reach a user's connected integration when a named integration tool or `api_call` is available.""",
 }
 
 _DOMAIN_TOOL_MAP = {
@@ -578,7 +579,7 @@ _DOMAIN_TOOL_MAP = {
     "files": {"bash", "python", "read_file", "write_file", "edit_file", "apply_patch", "todowrite", "grep", "glob", "ls", "get_workspace", "inspect_code", "manage_bg_jobs"},
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
     "contacts": {"resolve_contact", "manage_contact"},
-    "integrations": {"api_call"},
+    "integrations": {"api_call", "proxmox"},
 }
 
 _WORKSPACE_TERMINUS_TOOLS = (
@@ -1476,7 +1477,28 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("cookbook")
     if has(r"\b(emails?|mails?|gmail|inbox|reply|forward|cc|bcc|send email|compose email|draft email|message chris|message him|message her)\b"):
         domains.add("email")
-    if has(r"\b(notes?|todos?|to-dos?|checklists?|tasks?|task list|remind me|reminders?|buy|pickup|pick up)\b"):
+    # "task/tasks" is overloaded: it can mean a personal to-do, or an
+    # operational task owned by another system (for example Proxmox task
+    # history). Strong personal-task wording always wins; generic read verbs
+    # such as "show/list tasks" only seed the personal task domain when the
+    # task noun is not clearly scoped to infrastructure.
+    _external_task_scope = has(
+        r"\b(?:proxmox|hypervisor|cluster|nodes?|vms?|lxc|guests?|backups?|migrations?)\b.{0,200}\btasks?\b",
+        r"\btasks?\b.{0,80}\b(?:proxmox|hypervisor|cluster|nodes?|vms?|lxc|guests?|backups?|migrations?)\b",
+    )
+    _strong_personal_task_intent = has(
+        r"\b(notes?|todos?|to-dos?|checklists?|task list|remind me|reminders?|buy|pickup|pick up)\b",
+        r"\b(?:my|today'?s|tomorrow'?s|current|existing|pending|open)\s+tasks?\b",
+        r"\b(?:add|create|make|complete|finish|delete|remove|update|edit)\b.{0,24}\b(?:a\s+|my\s+)?tasks?\b",
+        r"\bwhat\b.{0,24}\btasks?\b",
+    )
+    _generic_task_read_intent = has(
+        r"\b(?:show|list|see|check)\b.{0,32}\btasks?\b",
+        r"\btasks?\b.{0,24}\b(?:show|list|see|check)\b",
+    )
+    if _strong_personal_task_intent or (
+        _generic_task_read_intent and not _external_task_scope
+    ):
         domains.add("notes_calendar_tasks")
     if has(r"\b(every day|every morning|every evening|recurring|automatically|cron|scheduled task|background task)\b"):
         domains.add("notes_calendar_tasks")
@@ -4104,6 +4126,34 @@ async def stream_agent_loop(
     # Track it separately so cross-domain pruning can never discard helpers
     # explicitly required by an upload or caller context.
     _broker_explicit_context_tools = set(forced_tools or set())
+
+    # If semantic retrieval already found a concrete tool and the user named
+    # that tool/integration explicitly, preserve it as high-confidence
+    # controller context. This prevents a weak generic domain guess (for
+    # example "tasks" -> notes/calendar) from suppressing an explicitly named
+    # Proxmox hit. This cannot expand authority: only names already present in
+    # the retrieved candidate set are eligible.
+    if not guide_only and _relevant_tools:
+        try:
+            from assistant.fork.tool_selector import (
+                explicitly_named_candidate_tools,
+            )
+            _explicit_name_tools = explicitly_named_candidate_tools(
+                _retrieval_query or _last_user,
+                _relevant_tools,
+            )
+            if _explicit_name_tools:
+                _broker_explicit_context_tools.update(_explicit_name_tools)
+                logger.info(
+                    "[tool-broker] explicit-name anchors=%s",
+                    sorted(_explicit_name_tools),
+                )
+        except Exception as _e:
+            logger.debug(
+                "[tool-broker] explicit-name detection skipped: %s",
+                _e,
+            )
+
     if not guide_only and uploaded_files:
         if _relevant_tools is None:
             from src.tool_index import ALWAYS_AVAILABLE

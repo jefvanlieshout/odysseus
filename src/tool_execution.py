@@ -774,7 +774,7 @@ async def _execute_tool_block_impl(
         do_edit_image, do_trigger_research, do_manage_research, do_resolve_contact,
         do_manage_contact,
         do_vault_search, do_vault_get, do_vault_unlock,
-        do_app_api, do_inspect_code,
+        do_app_api, do_inspect_code, do_proxmox,
     )
 
     # HACK:
@@ -1054,6 +1054,9 @@ async def _execute_tool_block_impl(
     elif tool == "inspect_code":
         desc = "inspect_code"
         result = await do_inspect_code(content, owner=owner)
+    elif tool == "proxmox":
+        desc = "proxmox"
+        result = await do_proxmox(content, owner=owner)
     elif tool == "list_serve_presets":
         desc = "list_serve_presets"
         result = await do_list_serve_presets(content, owner=owner)
