@@ -25,6 +25,7 @@ from assistant.fork.tool_catalog import (
     record_for_runtime_name,
 )
 from assistant.fork.tool_selector import build_candidate_plan
+from assistant.fork.tool_contracts import explicitly_named_provider_ids
 
 _MCP_QUALIFIED_RE = re.compile(r"\bmcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+\b")
 
@@ -246,6 +247,8 @@ def preview_final_tool_visibility(
     suggested_capabilities: Iterable[str] = (),
     max_visible: int | None = None,
     domain_members: Mapping[str, Iterable[str]] | None = None,
+    turn_text: str = "",
+    read_only_only: bool = False,
 ) -> BrokerVisibilityPreview:
     """Select final visibility from independent candidate providers.
 
@@ -275,6 +278,14 @@ def preview_final_tool_visibility(
         disabled_tools=disabled,
         domain_members=domain_members,
     )
+    named_provider_ids = explicitly_named_provider_ids(
+        turn_text,
+        (
+            record.contract
+            for record in records.values()
+            if record.contract is not None
+        ),
+    )
 
     # Caller-provided/custom runtime tools must remain selectable even when an
     # older Odysseus metadata surface has not learned about them yet. They get
@@ -293,7 +304,13 @@ def preview_final_tool_visibility(
                 domain_members=domain_members,
             )
 
-    permitted = set(records)
+    permitted = {
+        name
+        for name, record in records.items()
+        if not read_only_only
+        or record.contract is None
+        or record.contract.read_only
+    }
     if not permitted:
         return BrokerVisibilityPreview(
             tools=set(),
@@ -331,6 +348,9 @@ def preview_final_tool_visibility(
         suggested_capabilities=suggested_capabilities,
         evidence_names=evidence,
         max_visible=max_visible,
+        named_provider_ids=named_provider_ids,
+        read_only_only=read_only_only,
+        query_text=turn_text,
     )
 
     broker = ToolBroker(descriptors, max_visible=plan.budget)
@@ -351,6 +371,9 @@ def preview_final_tool_visibility(
         }),
         "selected_total": len(proposed),
         "cross_domain_suppressed": len(plan.suppressed_cross_domain),
+        "named_provider_count": len(named_provider_ids),
+        "read_only_only": int(bool(read_only_only)),
+        "read_only_pruned": len(records) - len(permitted),
     }
     diagnostics.update({
         f"candidate:{reason}": int(count)

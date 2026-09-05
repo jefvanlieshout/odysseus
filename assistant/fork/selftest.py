@@ -39,6 +39,71 @@ class _FakeMcpManager:
             {"qualified_name": "mcp__builtin_browser__browser_type"},
             {"qualified_name": "mcp__builtin_browser__browser_press_key"},
             {"qualified_name": "mcp__builtin_browser__browser_tabs"},
+            {
+                "server_id": "3dc06684",
+                "server_name": "Fastmail",
+                "name": "search_email",
+                "qualified_name": "mcp__3dc06684__search_email",
+                "description": "Search email and return matching message identifiers.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+                "read_only": True,
+            },
+            {
+                "server_id": "3dc06684",
+                "server_name": "Fastmail",
+                "name": "read_email",
+                "qualified_name": "mcp__3dc06684__read_email",
+                "description": "Read one email by id.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"emailId": {"type": "string"}},
+                    "required": ["emailId"],
+                },
+                "read_only": True,
+            },
+            {
+                "server_id": "3dc06684",
+                "server_name": "Fastmail",
+                "name": "read_thread",
+                "qualified_name": "mcp__3dc06684__read_thread",
+                "description": "Read an email thread by thread id.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"threadId": {"type": "string"}},
+                    "required": ["threadId"],
+                },
+                "read_only": True,
+            },
+            {
+                "server_id": "3dc06684",
+                "server_name": "Fastmail",
+                "name": "list_folders",
+                "qualified_name": "mcp__3dc06684__list_folders",
+                "description": "List mailbox folders.",
+                "input_schema": {"type": "object", "properties": {}},
+                "read_only": True,
+            },
+            {
+                "server_id": "3dc06684",
+                "server_name": "Fastmail",
+                "name": "list_identities",
+                "qualified_name": "mcp__3dc06684__list_identities",
+                "description": "List sending identities.",
+                "input_schema": {"type": "object", "properties": {}},
+                "read_only": True,
+            },
+            {
+                "server_id": "3dc06684",
+                "server_name": "Fastmail",
+                "name": "list_calendars",
+                "qualified_name": "mcp__3dc06684__list_calendars",
+                "description": "List calendars.",
+                "input_schema": {"type": "object", "properties": {}},
+                "read_only": True,
+            },
             {"qualified_name": "mcp__other__unrelated"},
         ]
 
@@ -246,6 +311,7 @@ def main() -> None:
         anchor_names_for_capabilities,
         audit_tool_catalog,
         build_tool_catalog,
+        enrich_tool_schemas_with_contracts,
     )
     from assistant.fork.tool_selector import build_candidate_plan
 
@@ -303,6 +369,140 @@ def main() -> None:
     ))
     assert {"list_emails", "read_email", "resolve_contact"} <= email_anchors
     assert "mcp__email__list_emails" not in email_anchors
+
+    # v0.4.5: generic MCP contracts classify Fastmail-style leaf tools without
+    # hard-coding the provider, preserve provider identity, and link discovery
+    # producers to required identifier consumers.
+    fast_search = catalog["mcp__3dc06684__search_email"]
+    fast_read = catalog["mcp__3dc06684__read_email"]
+    fast_thread = catalog["mcp__3dc06684__read_thread"]
+    assert fast_search.provider == "Fastmail"
+    assert "domain:email" in fast_search.capabilities
+    assert "domain:email" in catalog["mcp__3dc06684__list_folders"].capabilities
+    assert "domain:email" in catalog["mcp__3dc06684__list_identities"].capabilities
+    assert "domain:notes_calendar_tasks" in catalog["mcp__3dc06684__list_calendars"].capabilities
+    assert fast_read.contract and fast_read.contract.read_only
+    assert "emailId" in fast_read.contract.required_inputs
+    assert "mcp__3dc06684__search_email" in fast_read.contract.producer_tools
+    assert fast_thread.contract and "mcp__3dc06684__search_email" in fast_thread.contract.producer_tools
+
+    enriched = enrich_tool_schemas_with_contracts(
+        [{
+            "type": "function",
+            "function": {
+                "name": "mcp__3dc06684__read_email",
+                "description": "Read one email by id.",
+                "parameters": fast_read.schema,
+            },
+        }],
+        catalog,
+    )
+    enriched_desc = enriched[0]["function"]["description"]
+    assert "read-only" in enriched_desc
+    assert "search_email" in enriched_desc
+    assert "never invent IDs" in enriched_desc
+
+    # Provider usage metadata is appended to the chosen MCP tool rather than
+    # baked into routing. Fastmail's search grammar requires in:<folder>; the
+    # controller also rejects the exact malformed form that caused the live
+    # "in inbox" regression before any remote call.
+    enriched_search = enrich_tool_schemas_with_contracts(
+        [{
+            "type": "function",
+            "function": {
+                "name": "mcp__3dc06684__search_email",
+                "description": "Search email.",
+                "parameters": fast_search.schema,
+            },
+        }],
+        catalog,
+    )
+    search_desc = enriched_search[0]["function"]["description"]
+    assert "in:<folder>" in search_desc
+    assert "in:inbox" in search_desc
+    assert "never write 'in inbox'" in search_desc
+
+    from assistant.fork.tool_contracts import (
+        explicit_read_only_request,
+        validate_contract_arguments,
+    )
+    assert explicit_read_only_request("Show my Fastmail inbox. Do not modify anything.")
+    missing_id = validate_contract_arguments(fast_read.contract, "{}")
+    assert missing_id and missing_id["policy"] == "tool_contract_prerequisite"
+    assert "emailId" in missing_id["missing"]
+    assert "mcp__3dc06684__search_email" in missing_id["producer_tools"]
+
+    bad_fastmail_query = validate_contract_arguments(
+        fast_search.contract, '{"query":"in inbox","limit":5}'
+    )
+    assert bad_fastmail_query
+    assert bad_fastmail_query["policy"] == "tool_contract_query_syntax"
+    assert bad_fastmail_query["suggested_query"] == "in:inbox"
+    assert validate_contract_arguments(
+        fast_search.contract, '{"query":"in:inbox","limit":5}'
+    ) is None
+
+    # Provider syntax guards must not leak into another MCP server merely
+    # because it exposes a tool with the same leaf name.
+    from assistant.fork.tool_contracts import build_contract
+    generic_search = build_contract(
+        name="mcp__other__search_email",
+        bare_name="search_email",
+        source="mcp",
+        provider="Other Mail",
+        server_id="other",
+        schema={"type": "object", "properties": {"query": {"type": "string"}}},
+        mcp_read_only=True,
+        domains={"email"},
+    )
+    assert validate_contract_arguments(
+        generic_search, '{"query":"in inbox","limit":5}'
+    ) is None
+
+    # The exact failure from the Fastmail trace: provider read tools must beat
+    # native email mutators, calendar siblings must not leak into email intent,
+    # and an explicit read-only constraint removes mutating alternatives.
+    fastmail_quality = preview_final_tool_visibility(
+        current={
+            "ask_user", "manage_memory", "update_plan",
+            "archive_email", "bulk_email", "delete_email", "send_email",
+            "list_email_accounts", "list_emails", "read_email",
+            "mcp__3dc06684__list_calendars",
+            "mcp__3dc06684__list_folders",
+            "mcp__3dc06684__list_identities",
+            "mcp__3dc06684__read_email",
+            "mcp__3dc06684__read_thread",
+            "mcp__3dc06684__search_email",
+        },
+        messages=[],
+        mcp_mgr=_FakeMcpManager(),
+        suggested_capabilities=broker_capabilities_for_domains({"email"}),
+        domain_members=_test_domain_members,
+        turn_text=(
+            "Gwen, check my Fastmail inbox. Show me my 5 newest emails and "
+            "briefly summarize each one. Do not modify anything."
+        ),
+        read_only_only=True,
+        max_visible=12,
+    )
+    assert {
+        "mcp__3dc06684__search_email",
+        "mcp__3dc06684__read_email",
+    } <= fastmail_quality.tools
+    assert {
+        "archive_email", "bulk_email", "delete_email", "send_email",
+        "manage_memory", "list_email_accounts", "list_emails", "read_email",
+        "mcp__3dc06684__list_calendars",
+        "mcp__3dc06684__list_folders",
+        "mcp__3dc06684__list_identities",
+        "mcp__3dc06684__read_thread",
+    }.isdisjoint(fastmail_quality.tools)
+    assert fastmail_quality.diagnostics["named_provider_count"] == 1
+    assert fastmail_quality.diagnostics["read_only_only"] == 1
+    assert fastmail_quality.reasons["mcp__3dc06684__search_email"] in {
+        "explicit-provider-domain", "retrieval-provider-match",
+        "dependency-producer",
+    }
 
     # Candidate providers do not gain authority: the Broker still rejects a
     # high-priority candidate outside the permitted controller set.
@@ -694,6 +894,11 @@ def main() -> None:
     print("  - repeated successful reads converge without backend re-execution")
     print("  - selector telemetry reports real budgets and suppression counts")
     print("  - execution context is sub-agent-ready provenance")
+    print("  - MCP tool contracts preserve provider/domain/effect/prerequisite metadata")
+    print("  - named providers outrank generic duplicates without gaining authority")
+    print("  - explicit read-only turns prune and execution-block state-changing tools")
+    print("  - dependency producers are promoted before identifier-consuming tools")
+    print("  - provider query-language hints + syntax guards prevent malformed Fastmail folder searches")
 
 
 if __name__ == "__main__":

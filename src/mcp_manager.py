@@ -210,6 +210,7 @@ class McpManager:
                         "name": tool.name,
                         "description": tool.description or "",
                         "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
+                        "output_schema": getattr(tool, "outputSchema", None) or {},
                         # MCP tool annotations (readOnlyHint / destructiveHint) drive
                         # plan-mode read-only gating. Absent on many servers, so we
                         # fall back to a name heuristic in mcp_tool_is_readonly().
@@ -279,6 +280,7 @@ class McpManager:
                         "name": tool.name,
                         "description": tool.description or "",
                         "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
+                        "output_schema": getattr(tool, "outputSchema", None) or {},
                         # MCP tool annotations (readOnlyHint / destructiveHint) drive
                         # plan-mode read-only gating. Absent on many servers, so we
                         # fall back to a name heuristic in mcp_tool_is_readonly().
@@ -366,6 +368,11 @@ class McpManager:
                     "name": tool.name,
                     "description": tool.description or "",
                     "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
+                    "output_schema": getattr(tool, "outputSchema", None) or {},
+                    # Streamable HTTP must preserve the same annotations as
+                    # stdio/SSE; otherwise provider readOnlyHint/destructiveHint
+                    # disappears before plan-mode / ToolBroker classification.
+                    "annotations": getattr(tool, "annotations", None),
                 })
 
             self._sessions[server_id] = session
@@ -616,6 +623,9 @@ class McpManager:
                     "qualified_name": f"mcp__{server_id}__{tool['name']}",
                     "description": tool.get("description", ""),
                     "input_schema": tool.get("input_schema") or {},
+                    "output_schema": tool.get("output_schema") or {},
+                    "annotations": tool.get("annotations"),
+                    "read_only": mcp_tool_is_readonly(tool),
                     "is_disabled": tool["name"] in disabled,
                 })
         return result

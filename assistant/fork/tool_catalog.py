@@ -15,9 +15,17 @@ Everything else is derived best-effort from Odysseus at runtime.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
+
+from assistant.fork.tool_contracts import (
+    ToolContract,
+    build_contract,
+    contract_prompt_hint,
+    infer_domains,
+    link_contract_dependencies,
+)
 
 
 # Small orchestration policy, NOT a duplicate list of every tool in a domain.
@@ -97,6 +105,11 @@ class ToolRecord:
     schema: Mapping[str, Any] | None = None
     effects: frozenset[str] = frozenset()
     security_known: bool = False
+    provider: str = ""
+    server_id: str = ""
+    bare_name: str = ""
+    output_schema: Mapping[str, Any] | None = None
+    contract: ToolContract | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,14 +338,58 @@ def _record(
     sources: Iterable[str] = (),
     description: str = "",
     schema: Mapping[str, Any] | None = None,
+    output_schema: Mapping[str, Any] | None = None,
     effects: Iterable[str] = (),
     security_known: bool = False,
     domain_members: Mapping[str, Iterable[str]] | None = None,
+    provider: str = "",
+    server_id: str = "",
+    mcp_read_only: bool | None = None,
+    provider_domains: Iterable[str] = (),
 ) -> ToolRecord:
     concrete = str(name or "").strip()
+    bare = bare_tool_name(concrete)
     caps = {f"tool:{concrete}"}
     caps.update(_domain_memberships(concrete, domain_members))
     caps.update(_dynamic_capabilities(concrete))
+
+    # Native Odysseus domain membership already has an authoritative source:
+    # ``domain_members`` supplied by the controller plus the small legacy
+    # dynamic capability map above.  Do not widen native capabilities merely
+    # from a descriptive tool name (e.g. ``manage_calendar``), because that
+    # changes verified capability-lease semantics.  External MCP tools do not
+    # have that upstream map, so infer their domains from provider metadata,
+    # leaf names and descriptions.
+    inferred_domains = (
+        infer_domains(
+            bare,
+            description,
+            provider_domains=provider_domains,
+        )
+        if source == "mcp"
+        else frozenset()
+    )
+    caps.update(f"domain:{domain}" for domain in inferred_domains)
+    domains = {
+        cap.split(":", 1)[1]
+        for cap in caps
+        if cap.startswith("domain:")
+    }
+    normalized_effects = frozenset(str(item) for item in effects if item)
+    contract = build_contract(
+        name=concrete,
+        bare_name=bare,
+        source=source,
+        description=description,
+        schema=schema,
+        output_schema=output_schema,
+        effects=normalized_effects,
+        security_known=security_known,
+        provider=provider,
+        server_id=server_id,
+        mcp_read_only=mcp_read_only,
+        domains=domains,
+    )
     return ToolRecord(
         name=concrete,
         source=source,
@@ -340,8 +397,13 @@ def _record(
         capabilities=frozenset(caps),
         description=str(description or ""),
         schema=schema,
-        effects=frozenset(str(item) for item in effects if item),
+        effects=normalized_effects,
         security_known=bool(security_known),
+        provider=str(provider or ""),
+        server_id=str(server_id or ""),
+        bare_name=bare,
+        output_schema=output_schema,
+        contract=contract,
     )
 
 
@@ -380,23 +442,65 @@ def build_tool_catalog(
             domain_members=normalized_domains,
         )
 
-    for tool in connected_mcp_tools(mcp_mgr):
+    # Remote MCP metadata is normalized in two passes. Strongly-named tools
+    # establish provider domains first; ambiguous siblings such as
+    # list_folders/list_identities may then inherit that provider context.
+    mcp_tools = connected_mcp_tools(mcp_mgr)
+    provider_domains: dict[str, set[str]] = {}
+    for tool in mcp_tools:
+        server_id = str(tool.get("server_id") or _mcp_server_id(
+            str(tool.get("qualified_name") or "")
+        )).strip()
+        bare = str(tool.get("name") or bare_tool_name(
+            str(tool.get("qualified_name") or "")
+        )).strip()
+        description = str(tool.get("description") or "").strip()
+        provider_domains.setdefault(server_id, set()).update(
+            infer_domains(bare, description)
+        )
+
+    for tool in mcp_tools:
         name = str(tool.get("qualified_name") or "").strip()
         if not name or name in disabled:
             continue
+        server_id = str(tool.get("server_id") or _mcp_server_id(name)).strip()
+        provider = str(tool.get("server_name") or server_id).strip()
         description = str(tool.get("description") or "").strip()
         schema = tool.get("input_schema") or tool.get("inputSchema")
+        output_schema = tool.get("output_schema") or tool.get("outputSchema")
+        mcp_read_only = tool.get("read_only")
         records[name] = _record(
             name,
             source="mcp",
             sources={"mcp"},
             description=description,
             schema=schema if isinstance(schema, Mapping) else None,
-            # Arbitrary MCP security remains fail-high in Odysseus; this field
-            # is informational only and never grants authority.
-            security_known=False,
+            output_schema=(
+                output_schema if isinstance(output_schema, Mapping) else None
+            ),
+            # MCP read/write classification comes from provider annotations
+            # when available and the manager's fail-high fallback otherwise.
+            security_known=mcp_read_only is not None,
             domain_members=normalized_domains,
+            provider=provider,
+            server_id=server_id,
+            mcp_read_only=(
+                bool(mcp_read_only) if mcp_read_only is not None else None
+            ),
+            provider_domains=provider_domains.get(server_id, ()),
         )
+
+    # Once every tool is normalized, attach provider-local producer links
+    # (search/list -> read/get identifier prerequisites).
+    contracts = link_contract_dependencies({
+        name: record.contract
+        for name, record in records.items()
+        if record.contract is not None
+    })
+    for name, contract in contracts.items():
+        record = records.get(name)
+        if record is not None:
+            records[name] = replace(record, contract=contract)
 
     return records
 
@@ -481,6 +585,33 @@ def anchor_names_for_capabilities(
                     seen.add(name)
                     out.append(name)
     return tuple(out)
+
+
+def enrich_tool_schemas_with_contracts(
+    schemas: Sequence[Mapping[str, Any]],
+    records: Mapping[str, ToolRecord],
+) -> list[dict[str, Any]]:
+    """Append compact contract hints without mutating upstream schema objects."""
+    enriched: list[dict[str, Any]] = []
+    for schema in schemas or ():
+        if not isinstance(schema, Mapping):
+            continue
+        outer = dict(schema)
+        fn = outer.get("function")
+        if not isinstance(fn, Mapping):
+            enriched.append(outer)
+            continue
+        fn_copy = dict(fn)
+        name = str(fn_copy.get("name") or "").strip()
+        record = records.get(name)
+        hint = contract_prompt_hint(record.contract) if record and record.contract else ""
+        if hint:
+            desc = str(fn_copy.get("description") or "").rstrip()
+            if hint.strip() not in desc:
+                fn_copy["description"] = (desc + hint).strip()
+        outer["function"] = fn_copy
+        enriched.append(outer)
+    return enriched
 
 
 def audit_tool_catalog(

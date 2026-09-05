@@ -3612,6 +3612,11 @@ async def stream_agent_loop(
     _t0 = time.time()
     _needs_admin = _detect_admin_intent(messages)
     _last_user = _extract_last_user_message(messages)
+    try:
+        from assistant.fork.tool_contracts import explicit_read_only_request
+        _turn_read_only_requested = explicit_read_only_request(_last_user)
+    except Exception:
+        _turn_read_only_requested = False
     _ody_qwen_finetune_model = _is_odysseus_qwen_model(model)
     # The caller's temperature survives for non-qwen routes; the qwen cap is
     # applied per candidate (here for the primary, in the candidate request
@@ -3710,6 +3715,7 @@ async def stream_agent_loop(
             _last_user[:80],
         )
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
+    _tool_contract_records = {}
     if _direct_low_signal:
         logger.info("[agent] direct low-signal reply path for latest=%r", _last_user[:80])
         direct_messages = (
@@ -4232,6 +4238,8 @@ async def stream_agent_loop(
                 forced_names=_broker_explicit_context_tools,
                 suggested_capabilities=_broker_suggested_capabilities,
                 domain_members=_DOMAIN_TOOL_MAP,
+                turn_text=_retrieval_query or _last_user,
+                read_only_only=_turn_read_only_requested,
             )
             logger.info(
                 "[tool-broker] final current=%s selected=%s added=%s removed=%s "
@@ -4251,6 +4259,31 @@ async def stream_agent_loop(
                 "[tool-broker] final visibility failed; preserving pre-Broker candidates: %s",
                 _e,
             )
+
+    # v0.4.5 normalized usage contracts power schema hints, prerequisite
+    # validation and explicit read-only enforcement. Build once per turn from
+    # the same native + connected-MCP metadata used by the Broker.
+    try:
+        from assistant.fork.tool_catalog import (
+            build_tool_catalog as _build_tool_contract_catalog,
+            record_for_runtime_name as _runtime_tool_contract_record,
+        )
+        _tool_contract_records = _build_tool_contract_catalog(
+            mcp_mgr=mcp_mgr,
+            disabled_tools=disabled_tools,
+            domain_members=_DOMAIN_TOOL_MAP,
+        )
+        for _contract_name in (_relevant_tools or set()):
+            if _contract_name not in _tool_contract_records:
+                _tool_contract_records[_contract_name] = _runtime_tool_contract_record(
+                    _contract_name, domain_members=_DOMAIN_TOOL_MAP
+                )
+    except Exception as _contract_catalog_error:
+        logger.warning(
+            "[tool-contract] catalog build failed; preserving legacy behavior: %s",
+            _contract_catalog_error,
+        )
+        _tool_contract_records = {}
 
     _self_code_request = _looks_like_self_code_request(_retrieval_query or _last_user)
     if not guide_only and _self_code_request:
@@ -4774,6 +4807,17 @@ async def stream_agent_loop(
                     if schema.get("function", {}).get("name") not in disabled_tools
                     and schema.get("name") not in disabled_tools
                 ]
+            if _tool_contract_records:
+                try:
+                    from assistant.fork.tool_catalog import enrich_tool_schemas_with_contracts
+                    schemas = enrich_tool_schemas_with_contracts(
+                        schemas, _tool_contract_records
+                    )
+                except Exception as _contract_schema_error:
+                    logger.debug(
+                        "[tool-contract] schema enrichment skipped: %s",
+                        _contract_schema_error,
+                    )
             return _filter_route_tool_schemas(schemas)
 
         wants_mcp = any(keyword in _last_user.lower() for keyword in _MCP_KEYWORDS)
@@ -5963,6 +6007,53 @@ async def stream_agent_loop(
             else:
                 cmd_display = full_command
 
+            _contract_result = None
+            _contract_record = _tool_contract_records.get(block.tool_type)
+            if _contract_record is None and _tool_contract_records:
+                try:
+                    from assistant.fork.tool_catalog import record_for_runtime_name
+                    _contract_record = record_for_runtime_name(
+                        block.tool_type, domain_members=_DOMAIN_TOOL_MAP
+                    )
+                    _tool_contract_records[block.tool_type] = _contract_record
+                except Exception:
+                    _contract_record = None
+            _contract = getattr(_contract_record, "contract", None)
+            if _turn_read_only_requested and _contract is not None and not _contract.read_only:
+                _contract_result = {
+                    "error": (
+                        f"Tool '{block.tool_type}' is state-changing and the latest "
+                        "user turn explicitly requested read-only/no-modification behavior."
+                    ),
+                    "exit_code": 1,
+                    "blocked": True,
+                    "policy": "explicit_read_only_turn",
+                }
+            elif _contract is not None:
+                try:
+                    from assistant.fork.tool_contracts import validate_contract_arguments
+                    _contract_result = validate_contract_arguments(
+                        _contract, block.content
+                    )
+                    if _contract_result and _contract.producer_tools and _relevant_tools is not None:
+                        _dependency_unlocks = {
+                            name for name in _contract.producer_tools
+                            if name not in disabled_tools
+                        }
+                        if _dependency_unlocks:
+                            _relevant_tools.update(_dependency_unlocks)
+                            if _base_relevant_tools is not None:
+                                _base_relevant_tools.update(_dependency_unlocks)
+                            logger.info(
+                                "[tool-contract] unlocked prerequisite producers for %s: %s",
+                                block.tool_type, sorted(_dependency_unlocks),
+                            )
+                except Exception as _contract_validation_error:
+                    logger.debug(
+                        "[tool-contract] prerequisite validation skipped for %s: %s",
+                        block.tool_type, _contract_validation_error,
+                    )
+
             security_decision = run_security.decision_for(
                 block.tool_type,
                 block.content,
@@ -5979,7 +6070,14 @@ async def stream_agent_loop(
             blocked_by_disabled_tools = bool(
                 disabled_tools and not policy_names.isdisjoint(disabled_tools)
             )
-            if (
+            if _contract_result is not None:
+                desc = f"{block.tool_type}: BLOCKED"
+                result = _contract_result
+                logger.info(
+                    "Tool blocked by normalized contract before backend call: %s policy=%s",
+                    block.tool_type, result.get("policy"),
+                )
+            elif (
                 (blocked_by_tool_policy or blocked_by_disabled_tools)
                 and not _ody_clamped_tool_allowed
             ):
@@ -6148,6 +6246,37 @@ async def stream_agent_loop(
                             await _tool_task
                         except (asyncio.CancelledError, Exception):
                             pass
+
+            # If an identifier-consuming tool failed, expose its known
+            # producer path instead of encouraging blind retries with guessed or
+            # stale IDs. This is advisory recovery metadata; it never executes
+            # the producer automatically.
+            if (
+                _contract is not None
+                and _contract.producer_tools
+                and not tool_result_is_successful(result)
+            ):
+                _recovery_producers = {
+                    name for name in _contract.producer_tools
+                    if name not in disabled_tools
+                }
+                if _recovery_producers and _relevant_tools is not None:
+                    _relevant_tools.update(_recovery_producers)
+                    if _base_relevant_tools is not None:
+                        _base_relevant_tools.update(_recovery_producers)
+                result.setdefault(
+                    "contract_hint",
+                    (
+                        "This tool consumes an identifier. If the ID is missing, "
+                        "stale, or invalid, use one of these producer tools first: "
+                        + ", ".join(sorted(_recovery_producers or _contract.producer_tools))
+                        + ". Never guess identifiers."
+                    ),
+                )
+                logger.info(
+                    "[tool-contract] failed identifier consumer %s; producer recovery=%s",
+                    block.tool_type, sorted(_recovery_producers),
+                )
 
             run_security.observe_tool_result(block.tool_type, result, block.content)
 
