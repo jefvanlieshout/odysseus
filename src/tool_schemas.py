@@ -454,6 +454,29 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "inspect_code",
+            "description": "Read-only inspection of Gwen/Odysseus' real host source repository. Use this to inspect your own implementation instead of guessing. Supports repository status, tree browsing, text search, bounded file reads, and git diff. Cannot write files or run arbitrary commands; secrets/runtime data are blocked.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["status", "tree", "search", "read", "diff"]},
+                    "path": {"type": "string", "description": "Repository-relative path. Never use an absolute path."},
+                    "query": {"type": "string", "description": "Search text or regex for action=search."},
+                    "start_line": {"type": "integer", "minimum": 1, "description": "First line for action=read."},
+                    "end_line": {"type": "integer", "minimum": 1, "description": "Last line for action=read; reads are capped."},
+                    "depth": {"type": "integer", "minimum": 0, "maximum": 5, "description": "Tree recursion depth."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 400, "description": "Maximum tree/search results."},
+                    "regex": {"type": "boolean", "description": "Treat query as a regular expression."},
+                    "case_sensitive": {"type": "boolean", "description": "Case-sensitive search."},
+                    "staged": {"type": "boolean", "description": "For diff: show staged rather than working-tree changes."}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_models",
             "description": "List all available AI models across configured endpoints. Optionally filter by keyword.",
             "parameters": {

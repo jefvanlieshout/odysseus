@@ -575,7 +575,7 @@ _DOMAIN_TOOL_MAP = {
     "notes_calendar_tasks": {"manage_notes", "manage_calendar", "manage_tasks"},
     "ui": {"ui_control"},
     "sessions": {"create_session", "list_sessions", "manage_session", "send_to_session", "search_chats"},
-    "files": {"bash", "python", "read_file", "write_file", "edit_file", "apply_patch", "todowrite", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs"},
+    "files": {"bash", "python", "read_file", "write_file", "edit_file", "apply_patch", "todowrite", "grep", "glob", "ls", "get_workspace", "inspect_code", "manage_bg_jobs"},
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
     "contacts": {"resolve_contact", "manage_contact"},
     "integrations": {"api_call"},
@@ -585,6 +585,22 @@ _WORKSPACE_TERMINUS_TOOLS = (
     _DOMAIN_TOOL_MAP["files"]
     | {"manage_skills", "ask_teacher", "web_search", "web_fetch", "ask_user", "update_plan"}
 )
+
+_SELF_CODE_BYPASS_TOOLS = {
+    "bash", "python", "read_file", "write_file", "edit_file",
+    "apply_patch", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs",
+}
+
+_SELF_CODE_RE = re.compile(
+    r"\b(?:gwen|odysseus)(?:[\'’]s)?\b.{0,80}\b(?:code|source|implementation|repo|repository|branch|commit)\b"
+    r"|\b(?:your|your own|own)\b.{0,40}\b(?:code|source|implementation|repo|repository|branch|commit)\b"
+    r"|\b(?:inspect|read|search|check|show)\b.{0,50}\b(?:your|your own|gwen|odysseus)\b.{0,50}\b(?:code|source|implementation|repo|repository)\b"
+    r"|\binspect[_ ]code\b",
+    re.IGNORECASE,
+)
+
+def _looks_like_self_code_request(text: str) -> bool:
+    return bool(_SELF_CODE_RE.search(str(text or "")))
 
 def _domain_rules_for_tools(tool_names: set) -> list[str]:
     names = set(tool_names or set())
@@ -4185,6 +4201,18 @@ async def stream_agent_loop(
                 "[tool-broker] final visibility failed; preserving pre-Broker candidates: %s",
                 _e,
             )
+
+    _self_code_request = _looks_like_self_code_request(_retrieval_query or _last_user)
+    if not guide_only and _self_code_request:
+        _before_self_code_tools = set(_relevant_tools or set())
+        _relevant_tools = set(_before_self_code_tools)
+        _relevant_tools.difference_update(_SELF_CODE_BYPASS_TOOLS)
+        _relevant_tools.add("inspect_code")
+        logger.info(
+            "[self-code] enforced inspect_code boundary removed=%s final=%s",
+            sorted(_before_self_code_tools - _relevant_tools),
+            sorted(_relevant_tools),
+        )
 
     _intent_domains = set(_intent.get("domains") or set())
     _base_relevant_tools = None if _relevant_tools is None else set(_relevant_tools)

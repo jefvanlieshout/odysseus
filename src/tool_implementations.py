@@ -58,6 +58,7 @@ from src.tools.cookbook import (  # noqa: F401
 # Search domain extracted to src/tools/search.py (slice 1, #4082/#4071).
 # Re-imported here so this module stays a working facade.
 from src.tools.search import do_search_chats  # noqa: F401
+from src.tools.code_inspection import do_inspect_code  # noqa: F401
 # Notes domain extracted to src/tools/notes.py (slice 1, #4082/#4071).
 from src.tools.notes import do_manage_notes  # noqa: F401
 # Calendar domain extracted to src/tools/calendar.py (slice 1, #4082/#4071).
