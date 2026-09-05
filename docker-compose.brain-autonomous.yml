@@ -21,76 +21,6 @@ services:
       jarvis-brain:
         condition: service_started
 
-  qwen-analyzer:
-    container_name: jarvis-qwen-analyzer
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda13-b10236@sha256:c76ef7b03c2f6bf74176344ed97caefb40c2ec3cadc15b419fbc69fdd4b97497
-    entrypoint:
-      - /app/llama-server
-    command:
-      - --model
-      - /models/Qwen3.8-27B-Q4_K_M.gguf
-      - --alias
-      - Qwen/Qwen3.8-27B
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-      - --n-gpu-layers
-      - "99"
-      - --ctx-size
-      - "32000"
-      - --flash-attn
-      - auto
-      - --fit
-      - "off"
-    volumes:
-      - ${APP_DATA_DIR:-./data}/huggingface/hub/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/Qwen3.8-27B-Q4_K_M.gguf:/models/Qwen3.8-27B-Q4_K_M.gguf:ro,z
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - curl -fsS http://127.0.0.1:8000/health >/dev/null || exit 1
-      interval: 5s
-      timeout: 4s
-      retries: 60
-      start_period: 15s
-    environment:
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
-    networks:
-      - default
-
-  qwen-loopback-proxy:
-    container_name: jarvis-qwen-loopback-proxy
-    build:
-      context: ./jarvis-brain
-      dockerfile: Dockerfile
-    entrypoint:
-      - python
-      - -u
-      - /opt/jarvis/qwen_loopback_proxy.py
-    environment:
-      QWEN_PROXY_TARGET_HOST: qwen-analyzer
-      QWEN_PROXY_TARGET_PORT: "8000"
-      QWEN_PROXY_LISTEN_HOST: 0.0.0.0
-      QWEN_PROXY_LISTEN_PORT: "8000"
-    volumes:
-      - ./jarvis-brain/scripts/qwen_loopback_proxy.py:/opt/jarvis/qwen_loopback_proxy.py:ro,z
-    network_mode: "service:odysseus"
-    restart: unless-stopped
-    depends_on:
-      odysseus:
-        condition: service_started
-      qwen-analyzer:
-        condition: service_healthy
-
   jarvis-brain:
     container_name: jarvis-brain-shadow
     build:
@@ -132,16 +62,16 @@ services:
       BRAIN_CHROMA_SEMANTIC_COLLECTION: jarvis_brain_shadow_semantic_v1
       BRAIN_CHROMA_EPISODIC_COLLECTION: jarvis_brain_shadow_episodic_v1
 
-      # Brain's analyzer is lifecycle-independent from Gwen/Odysseus.
-      # The worker reaches the dedicated official llama.cpp service over the
-      # normal Compose network instead of sharing Odysseus' network namespace.
-      BRAIN_LLM_URL: ${BRAIN_LLM_URL:-http://qwen-analyzer:8000/v1/chat/completions}
+      # Brain's analyzer is intentionally independent from Gwen's current chat model.
+      # The worker shares Odysseus' network namespace so 127.0.0.1 reaches the
+      # same local OpenAI-compatible endpoint proven by the live CREATE/MATCH gates.
+      BRAIN_LLM_URL: ${BRAIN_LLM_URL:-http://127.0.0.1:8000/v1/chat/completions}
       BRAIN_LLM_MODEL: ${BRAIN_LLM_MODEL:-Qwen/Qwen3.8-27B}
       BRAIN_LLM_TIMEOUT_SECONDS: ${BRAIN_LLM_TIMEOUT_SECONDS:-120}
       BRAIN_LLM_MAX_TOKENS: ${BRAIN_LLM_MAX_TOKENS:-900}
       BRAIN_LLM_TEMPERATURE: ${BRAIN_LLM_TEMPERATURE:-0}
       BRAIN_LLM_REASONING_EFFORT: ${BRAIN_LLM_REASONING_EFFORT:-medium}
-      BRAIN_LLM_READY_URL: ${BRAIN_LLM_READY_URL:-http://qwen-analyzer:8000/v1/models}
+      BRAIN_LLM_READY_URL: ${BRAIN_LLM_READY_URL:-http://127.0.0.1:8000/v1/models}
       BRAIN_LLM_READY_TIMEOUT_SECONDS: ${BRAIN_LLM_READY_TIMEOUT_SECONDS:-2}
       BRAIN_LLM_UNAVAILABLE_POLL_SECONDS: ${BRAIN_LLM_UNAVAILABLE_POLL_SECONDS:-10}
 
@@ -151,12 +81,11 @@ services:
       BRAIN_WORKER_MAX_CONSECUTIVE_JOBS: ${BRAIN_WORKER_MAX_CONSECUTIVE_JOBS:-8}
     volumes:
       - jarvis-brain-shadow-data:/data
-    networks:
-      - default
+    network_mode: "service:odysseus"
     restart: unless-stopped
     depends_on:
-      qwen-analyzer:
-        condition: service_healthy
+      odysseus:
+        condition: service_started
       jarvis-brain:
         condition: service_started
       chromadb:

@@ -3,28 +3,10 @@ set -euo pipefail
 
 BRAIN_CONTAINER="jarvis-brain-shadow"
 WORKER_CONTAINER="jarvis-brain-semantic-worker"
-ANALYZER_CONTAINER="jarvis-qwen-analyzer"
-PROXY_CONTAINER="jarvis-qwen-loopback-proxy"
 
 echo "Containers:"
-docker ps -a --filter "name=${BRAIN_CONTAINER}" --filter "name=${WORKER_CONTAINER}" --filter "name=${ANALYZER_CONTAINER}" --filter "name=${PROXY_CONTAINER}" --format '  {{.Names}}  {{.Status}}'
-
-echo
-echo "Analyzer model endpoint:"
-if [[ "$(docker inspect -f '{{.State.Running}}' "$ANALYZER_CONTAINER" 2>/dev/null || true)" == "true" ]]; then
-  docker exec "$ANALYZER_CONTAINER" curl -fsS http://127.0.0.1:8000/v1/models || true
-  echo
-else
-  echo "  analyzer is not running"
-fi
-
-echo
-echo "Worker analyzer probe:"
-if [[ "$(docker inspect -f '{{.State.Running}}' "$WORKER_CONTAINER" 2>/dev/null || true)" == "true" ]]; then
-  docker exec "$WORKER_CONTAINER" python -m jarvis_brain.worker_daemon --probe-llm 2>&1 || true
-else
-  echo "  worker is not running"
-fi
+docker ps -a --filter "name=${BRAIN_CONTAINER}" --filter "name=${WORKER_CONTAINER}" \
+  --format '  {{.Names}}  {{.Status}}'
 
 echo
 echo "Brain state:"
