@@ -52,3 +52,6 @@ timetree*.png
 *_signin_page.png
 *_calendar_view.png
 .gitignore
+
+# Accidental/nested Odysseus checkout - never part of image build context
+/odysseus/
