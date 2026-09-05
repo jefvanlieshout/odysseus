@@ -540,6 +540,8 @@ _APP_API_BLOCKLIST_PREFIXES = (
     "/api/tokens",         # api token mgmt (bare /api/tokens list+create must also block)
     "/api/admin",          # admin one-shots (wipe etc.)
     "/api/shell",          # host shell execution must stay behind named command tooling
+    "/api/memory",         # APP_API_NATIVE_MEMORY_AUTHORITY_V1: use manage_memory instead
+    "/api/codex/memory",   # alternate native-memory wrapper; same authority boundary
     "/api/backup/restore", # destructive restore
 )
 
@@ -600,8 +602,10 @@ async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
 
     The `endpoints` action returns the OpenAPI surface (method + path +
     summary) so the agent can discover what's reachable. A blocklist
-    refuses sensitive auth/user/admin/shell paths and method-specific
-    host-control routes to keep blast radius bounded.
+    refuses sensitive auth/user/admin/shell paths, native memory routes,
+    and method-specific host-control routes to keep blast radius bounded.
+    Agent memory access must go through manage_memory so the configured
+    memory backend remains the single authority.
     """
     # `_internal_headers` and `_INTERNAL_BASE` still live in
     # tool_implementations.py (shared by many domain tools). Function-local
@@ -667,6 +671,8 @@ async def do_app_api(content: str, owner: Optional[str] = None) -> Dict:
     if not path.startswith("/"):
         path = "/" + path
     if any(path.startswith(p) for p in _APP_API_BLOCKLIST_PREFIXES):
+        if path.startswith("/api/memory"):
+            return {"error": "Native /api/memory routes are not available through app_api. Use manage_memory so the configured memory backend remains authoritative.", "exit_code": 1}
         return {"error": f"Path blocked for safety: {path}. Sensitive endpoints are off-limits via app_api.", "exit_code": 1}
 
     method = (args.get("method") or "GET").upper()

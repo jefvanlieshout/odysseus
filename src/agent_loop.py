@@ -820,7 +820,7 @@ GENERIC LOOPBACK to allowed Odysseus internal endpoints. Use this whenever the u
 - Cookbook: `/api/cookbook/gpus`, `/api/cookbook/state`, `/api/cookbook/setup`, `/api/cookbook/packages`, `/api/cookbook/hf-latest`, `/api/model/cached`. Do NOT use `app_api` for package installs, engine rebuilds, or PID signalling.
 - Gallery: `/api/gallery/list`, `/api/gallery/delete`, `/api/gallery/{id}`, `/api/gallery/albums`
 - Library / Documents: list all via `/api/documents/library`; docs in a session via `/api/documents/{session_id}`; a single doc via `/api/document/{id}` (singular) and its history via `/api/document/{id}/versions` (singular). Note the plural `/api/documents/...` vs singular `/api/document/{id}` split.
-- Memory: `/api/memory`, `/api/memory/{id}`, `/api/memory/search`
+- Memory: NEVER use `app_api` for `/api/memory*`; use `manage_memory`. The configured memory backend is authoritative.
 - Notes: `/api/notes`, `/api/notes/{id}`
 - Tasks: `/api/tasks`, `/api/tasks/{id}/run`, `/api/tasks/notifications`
 - Sessions: `/api/sessions`, `/api/session/{id}`, `/api/session/{id}/truncate`
@@ -836,7 +836,7 @@ Body for POST/PUT/PATCH goes in `body` (object). Query params in `query` (object
 
 **When to prefer named tools over app_api:** if a named wrapper exists (list_email_accounts, list_emails, read_email, scan_email_unsubscribes, manage_calendar, manage_notes, list_served_models, etc.) USE IT — it has nicer output formatting and clearer schema. Reach for `app_api` only when there's no wrapper for what you need.
 
-Blocked paths/routes (refused for safety): /api/auth/, /api/users/, /api/tokens/, /api/admin/, /api/shell/, /api/backup/restore, /api/email/accounts, POST /api/cookbook/packages/install, POST /api/cookbook/rebuild-engine, POST /api/cookbook/kill-pid.""",
+Blocked paths/routes (refused for safety): /api/auth/, /api/users/, /api/tokens/, /api/admin/, /api/shell/, /api/memory*, /api/codex/memory*, /api/backup/restore, /api/email/accounts, POST /api/cookbook/packages/install, POST /api/cookbook/rebuild-engine, POST /api/cookbook/kill-pid. Memory operations must use `manage_memory`.""",
 }
 
 def get_builtin_overrides() -> dict:
