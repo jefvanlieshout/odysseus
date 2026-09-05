@@ -238,19 +238,15 @@ class VectorSidecarTests(unittest.TestCase):
         self.brain.rebuild_vector_index(owner_id="jef")
         self.assertNotIn(result.memory_uuid, self.client.collections["test_semantic"].items)
 
-    def test_hybrid_search_uses_real_vector(self):
+    def test_hybrid_search_uses_real_vector_without_fake_recall_event(self):
         _obs, result = self.create_memory()
-        hits = self.brain.search(
-            owner_id="jef",
-            query="fish shell",
-            include_episodes=False,
-        )
+        with self.brain.store.read() as db:
+            before = db.execute("SELECT COUNT(*) FROM recall_events WHERE owner_id='jef'").fetchone()[0]
+        hits = self.brain.search(owner_id="jef", query="fish shell", include_episodes=False)
         self.assertTrue(any(h.uuid == result.memory_uuid for h in hits))
         with self.brain.store.read() as db:
-            row = db.execute(
-                "SELECT vector_used FROM recall_events WHERE owner_id='jef' ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-        self.assertEqual(int(row[0]), 1)
+            after = db.execute("SELECT COUNT(*) FROM recall_events WHERE owner_id='jef'").fetchone()[0]
+        self.assertEqual(before, after)
 
     def test_recall_context_is_bounded_and_provenance_rich(self):
         obs, result = self.create_memory(
@@ -376,6 +372,63 @@ class VectorSidecarTests(unittest.TestCase):
                 for item in packet["selected"]
             )
         )
+
+    def test_recall_receipt_records_selection_then_injection(self):
+        _obs, result = self.create_memory("jef", "receipt-fish", "I use fish shell.")
+        packet = self.brain.recall_context(
+            owner_id="jef", query="Which shell do I use?", external_session_ref="session-receipt"
+        )
+        event_uuid = packet["recall_event_uuid"]
+        self.assertTrue(event_uuid)
+        event = next(e for e in self.brain.list_recall_events(owner_id="jef", limit=10) if e["uuid"] == event_uuid)
+        self.assertFalse(event["injected"])
+        self.assertEqual(event["selection_mode"], "semantic")
+        self.assertEqual(event["selected"][0]["uuid"], result.memory_uuid)
+        self.assertEqual(event["external_session_ref"], "session-receipt")
+        self.assertTrue(self.brain.mark_recall_injected(owner_id="jef", recall_event_uuid=event_uuid))
+        self.assertFalse(self.brain.mark_recall_injected(owner_id="jef", recall_event_uuid=event_uuid))
+        event = next(e for e in self.brain.list_recall_events(owner_id="jef", limit=10) if e["uuid"] == event_uuid)
+        self.assertTrue(event["injected"])
+        self.assertTrue(event["injected_at"])
+
+    def test_recall_debug_does_not_create_receipt(self):
+        self.create_memory("jef", "debug-fish", "I use fish shell.")
+        with self.brain.store.read() as db:
+            before = db.execute("SELECT COUNT(*) FROM recall_events WHERE owner_id='jef'").fetchone()[0]
+        packet = self.brain.recall_debug(owner_id="jef", query="fish shell")
+        self.assertEqual(packet["selection_mode"], "semantic")
+        self.assertIsNone(packet["recall_event_uuid"])
+        with self.brain.store.read() as db:
+            after = db.execute("SELECT COUNT(*) FROM recall_events WHERE owner_id='jef'").fetchone()[0]
+        self.assertEqual(before, after)
+
+    def test_explicit_memory_control_preserves_history(self):
+        created = self.brain.create_memory_explicit(
+            owner_id="jef", content="The user prefers orange terminal accents.", memory_type="preference",
+            external_source_ref="ctl-add", session_id="s-control",
+        )
+        memory_uuid = created["memory_uuid"]
+        self.assertTrue(created["changed"])
+        updated = self.brain.update_memory_explicit(
+            owner_id="jef", memory_ref=memory_uuid[:8], content="The user prefers purple terminal accents.",
+            external_source_ref="ctl-edit", session_id="s-control",
+        )
+        self.assertTrue(updated["changed"])
+        self.assertEqual(updated["memory_uuid"], memory_uuid)
+        self.assertEqual(updated["revision_no"], 2)
+        history = self.brain.memory_history(owner_id="jef", memory_uuid=memory_uuid)
+        self.assertEqual([row["operation"] for row in history], ["CREATE", "UPDATE"])
+        self.assertIn("orange", history[0]["content"])
+        self.assertIn("purple", history[1]["content"])
+        forgotten = self.brain.forget_memory_explicit(
+            owner_id="jef", memory_ref=memory_uuid[:8], external_source_ref="ctl-forget", session_id="s-control",
+        )
+        self.assertEqual(forgotten["action"], "FORGET")
+        self.assertEqual(self.brain.list_memories(owner_id="jef"), [])
+        full = self.brain.list_memories(owner_id="jef", include_forgotten=True)
+        self.assertEqual(full[0]["uuid"], memory_uuid)
+        history = self.brain.memory_history(owner_id="jef", memory_uuid=memory_uuid)
+        self.assertEqual(history[-1]["operation"], "FORGET")
 
     def test_health_reports_vector_backend(self):
         health = self.brain.health()
@@ -506,6 +559,49 @@ class VectorSidecarTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_api_recall_debug_receipt_and_memory_control(self):
+        key = "b"*40
+        server, thread = start_server_in_thread(self.brain, key)
+        try:
+            host, port = server.server_address
+            base = f"http://{host}:{port}"
+            status, body = http_json(
+                base+"/v1/memory/manage", key=key,
+                payload={"owner_id":"jef","action":"add","text":"The user prefers turquoise terminal accents.",
+                         "memory_type":"preference","external_source_ref":"api-control-add","session_id":"api-control"},
+            )
+            self.assertEqual(status, 200)
+            memory_uuid = body["memory_uuid"]
+            status, body = http_json(base+"/v1/recall/debug", key=key, payload={"owner_id":"jef","query":"terminal accents"})
+            self.assertEqual(status, 200)
+            self.assertIsNone(body["recall_event_uuid"])
+            status, body = http_json(
+                base+"/v1/recall", key=key,
+                payload={"owner_id":"jef","query":"terminal accents","external_session_ref":"api-recall-session"},
+            )
+            self.assertEqual(status, 200)
+            event_uuid = body["recall_event_uuid"]
+            status, body = http_json(
+                base+"/v1/recall/mark-injected", key=key,
+                payload={"owner_id":"jef","recall_event_uuid":event_uuid},
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(body["changed"])
+            status, body = http_json(base+"/v1/recall/events", key=key, payload={"owner_id":"jef","limit":10})
+            self.assertEqual(status, 200)
+            receipt = next(item for item in body["events"] if item["uuid"] == event_uuid)
+            self.assertTrue(receipt["injected"])
+            self.assertEqual(receipt["selected"][0]["uuid"], memory_uuid)
+            status, body = http_json(
+                base+"/v1/memory/manage", key=key,
+                payload={"owner_id":"jef","action":"history","memory_ref":memory_uuid[:8]},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body["memory_uuid"], memory_uuid)
+            self.assertTrue(body["history"])
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=2)
 
     def test_api_replay_conflict_is_409(self):
         key = "q"*40

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 V1_DDL = r"""
 CREATE TABLE IF NOT EXISTS brain_meta (
@@ -291,6 +291,28 @@ def _migrate_v2_to_v3(db: sqlite3.Connection) -> None:
         "ON semantic_jobs(status, lease_expires_at)"
     )
 
+
+def _migrate_v3_to_v4(db: sqlite3.Connection) -> None:
+    # Turn recall_events from generic search audit into actual Recall receipts.
+    columns = {row[1] for row in db.execute("PRAGMA table_info(recall_events)").fetchall()}
+    additions = {
+        "candidate_count": "INTEGER NOT NULL DEFAULT 0",
+        "eligible_semantic_count": "INTEGER NOT NULL DEFAULT 0",
+        "eligible_episode_count": "INTEGER NOT NULL DEFAULT 0",
+        "selected_count": "INTEGER NOT NULL DEFAULT 0",
+        "selection_mode": "TEXT NOT NULL DEFAULT 'none'",
+        "selected_json": "TEXT NOT NULL DEFAULT '[]'",
+        "context_chars": "INTEGER NOT NULL DEFAULT 0",
+        "injected": "INTEGER NOT NULL DEFAULT 0",
+        "injected_at": "TEXT",
+        "external_session_ref": "TEXT",
+    }
+    for name, column_type in additions.items():
+        if name not in columns:
+            db.execute(f"ALTER TABLE recall_events ADD COLUMN {name} {column_type}")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_recall_owner_time ON recall_events(owner_id, created_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_recall_owner_injected ON recall_events(owner_id, injected, created_at DESC)")
+
 def initialize_schema(db: sqlite3.Connection) -> None:
     configure_connection(db)
     # WAL is a database-level setting. Apply it during initialization/migration,
@@ -320,6 +342,12 @@ def initialize_schema(db: sqlite3.Connection) -> None:
         _set_version(db, 3)
         db.commit()
         version = 3
+
+    if version == 3:
+        _migrate_v3_to_v4(db)
+        _set_version(db, 4)
+        db.commit()
+        version = 4
 
     if version != SCHEMA_VERSION:
         raise RuntimeError(

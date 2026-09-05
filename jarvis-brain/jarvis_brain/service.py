@@ -610,6 +610,203 @@ class BrainMemoryService:
                 exc,
             )
 
+    def capture_memory_control_evidence(
+        self, *, owner_id: str, raw_text: str, external_source_ref: str,
+        session_id: str | None = None, metadata: dict | None = None,
+    ) -> dict:
+        owner_id = self._require_text(owner_id, "owner_id")
+        raw_text = self._require_text(raw_text, "raw_text")
+        external_source_ref = self._require_text(external_source_ref, "external_source_ref")
+        now = utc_now()
+        metadata_json = self.store.dump_json(metadata)
+        with self.store.write() as db:
+            existing = db.execute(
+                "SELECT uuid, raw_text FROM evidence WHERE owner_id=? AND source_kind=? AND external_source_ref=?",
+                (owner_id, SourceKind.EXPLICIT_USER_MEMORY.value, external_source_ref),
+            ).fetchone()
+            if existing:
+                if str(existing["raw_text"]) != raw_text:
+                    raise IdempotencyConflict("memory-control evidence replay changed raw_text")
+                return {"created": False, "evidence_uuid": str(existing["uuid"])}
+            evidence_uuid = new_uuid()
+            db.execute(
+                "INSERT INTO evidence(uuid, owner_id, source_kind, external_source_ref, raw_text, "
+                "session_id, occurred_at, metadata_json, created_at, message_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,NULL)",
+                (evidence_uuid, owner_id, SourceKind.EXPLICIT_USER_MEMORY.value, external_source_ref,
+                 raw_text, session_id, now, metadata_json, now),
+            )
+        return {"created": True, "evidence_uuid": evidence_uuid}
+
+    def resolve_memory_uuid(self, *, owner_id: str, memory_ref: str, include_forgotten: bool = True) -> str:
+        owner_id = self._require_text(owner_id, "owner_id")
+        memory_ref = self._require_text(memory_ref, "memory_ref")
+        if len(memory_ref) < 4:
+            raise ValueError("memory_ref prefix must contain at least 4 characters")
+        sql = "SELECT uuid FROM semantic_memories WHERE owner_id=?"
+        params: list[object] = [owner_id]
+        if not include_forgotten:
+            sql += " AND status='current'"
+        sql += " AND (uuid=? OR uuid LIKE ?)"
+        params.extend([memory_ref, memory_ref + "%"])
+        with self.store.read() as db:
+            rows = db.execute(sql, params).fetchall()
+        uuids = sorted({str(row["uuid"]) for row in rows})
+        if not uuids:
+            raise NotFound("memory not found")
+        if memory_ref in uuids:
+            return memory_ref
+        if len(uuids) != 1:
+            raise ValueError("memory_ref prefix is ambiguous")
+        return uuids[0]
+
+    def create_memory_explicit(
+        self, *, owner_id: str, content: str, memory_type: str, external_source_ref: str,
+        session_id: str | None = None, scope: str = "explicit", reason: str | None = None,
+    ) -> dict:
+        owner_id = self._require_text(owner_id, "owner_id")
+        content = self._require_text(content, "content")
+        memory_type = str(memory_type or "fact").strip() or "fact"
+        scope = str(scope or "explicit").strip() or "explicit"
+        evidence = self.capture_memory_control_evidence(
+            owner_id=owner_id, raw_text=content, external_source_ref=external_source_ref,
+            session_id=session_id, metadata={"action": "ADD", "memory_type": memory_type},
+        )
+        evidence_uuid = str(evidence["evidence_uuid"])
+        idempotency_key = f"control:add:{external_source_ref}"
+        request_hash = self._hash_payload({
+            "action": "ADD", "content": content, "memory_type": memory_type,
+            "scope": scope, "evidence_uuid": evidence_uuid,
+        })
+        changed = False
+        with self.store.write() as db:
+            replay = self._memory_event_replay(db, owner_id, idempotency_key, request_hash)
+            if replay:
+                return {
+                    "action": str(replay["action"]), "memory_uuid": str(replay["target_memory_uuid"]),
+                    "revision_no": replay["result_revision_no"], "changed": str(replay["action"]) == "ADD",
+                }
+            exact = db.execute(
+                "SELECT * FROM semantic_memories WHERE owner_id=? AND status='current' "
+                "AND lower(trim(current_content))=lower(trim(?)) ORDER BY id LIMIT 1",
+                (owner_id, content),
+            ).fetchone()
+            now = utc_now()
+            evidence_row = self._require_evidence(db, owner_id, evidence_uuid)
+            if exact:
+                memory_uuid = str(exact["uuid"])
+                revision_no = self._latest_revision_no(db, int(exact["id"])) or 0
+                action = "ADD_DUPLICATE"
+            else:
+                memory_uuid = new_uuid()
+                cur = db.execute(
+                    "INSERT INTO semantic_memories(uuid, owner_id, current_content, memory_type, scope, confidence, "
+                    "status, pinned, created_at, updated_at) VALUES(?,?,?,?,?,1.0,'current',0,?,?)",
+                    (memory_uuid, owner_id, content, memory_type, scope, now, now),
+                )
+                memory_id = int(cur.lastrowid)
+                revision_no, _revision_uuid, revision_id = self._insert_revision(
+                    db, memory_id=memory_id, operation="CREATE", content=content, memory_type=memory_type,
+                    scope=scope, confidence=1.0, change_reason=reason or "Explicit user memory add.", now=now,
+                )
+                self._link_evidence(db, revision_id, int(evidence_row["id"]), now,
+                                    relation_type="MEMORY_CONTROL", details="Explicit user memory add.")
+                action = "ADD"
+                changed = True
+            self._record_memory_event(
+                db, owner_id, idempotency_key, request_hash, memory_uuid, action,
+                int(evidence_row["id"]), int(revision_no), reason or "Explicit user memory add.", now,
+            )
+        if changed:
+            try:
+                self.vector.upsert(owner_id=owner_id, kind="semantic", uuid=memory_uuid, text=content)
+            except Exception as exc:
+                logger.warning("Brain derived-vector side effect failed: %s: %s", type(exc).__name__, exc)
+        return {"action": action, "memory_uuid": memory_uuid, "revision_no": int(revision_no), "changed": changed}
+
+    def update_memory_explicit(
+        self, *, owner_id: str, memory_ref: str, content: str, external_source_ref: str,
+        session_id: str | None = None, reason: str | None = None,
+    ) -> dict:
+        owner_id = self._require_text(owner_id, "owner_id")
+        content = self._require_text(content, "content")
+        memory_uuid = self.resolve_memory_uuid(owner_id=owner_id, memory_ref=memory_ref)
+        evidence = self.capture_memory_control_evidence(
+            owner_id=owner_id, raw_text=content, external_source_ref=external_source_ref,
+            session_id=session_id, metadata={"action": "EDIT", "memory_uuid": memory_uuid},
+        )
+        evidence_uuid = str(evidence["evidence_uuid"])
+        idempotency_key = f"control:edit:{external_source_ref}"
+        request_hash = self._hash_payload({
+            "action": "EDIT", "memory_uuid": memory_uuid, "content": content, "evidence_uuid": evidence_uuid,
+        })
+        changed = False
+        with self.store.write() as db:
+            replay = self._memory_event_replay(db, owner_id, idempotency_key, request_hash)
+            if replay:
+                return {
+                    "action": str(replay["action"]), "memory_uuid": memory_uuid,
+                    "revision_no": replay["result_revision_no"], "changed": str(replay["action"]) == "EDIT",
+                }
+            memory = self._require_memory(db, owner_id, memory_uuid)
+            evidence_row = self._require_evidence(db, owner_id, evidence_uuid)
+            now = utc_now()
+            old_revision = db.execute(
+                "SELECT uuid, revision_no FROM memory_revisions WHERE memory_id=? ORDER BY revision_no DESC LIMIT 1",
+                (int(memory["id"]),),
+            ).fetchone()
+            if str(memory["current_content"]).strip() == content.strip() and str(memory["status"]) == "current":
+                revision_no = self._latest_revision_no(db, int(memory["id"])) or 0
+                action = "EDIT_NOOP"
+            else:
+                db.execute(
+                    "UPDATE semantic_memories SET current_content=?, status='current', confidence=1.0, updated_at=? WHERE id=?",
+                    (content, now, int(memory["id"])),
+                )
+                revision_no, revision_uuid, revision_id = self._insert_revision(
+                    db, memory_id=int(memory["id"]), operation="UPDATE", content=content,
+                    memory_type=str(memory["memory_type"]), scope=str(memory["scope"]), confidence=1.0,
+                    change_reason=reason or "Explicit user memory edit.", now=now,
+                )
+                self._carry_revision_evidence(db, int(memory["id"]), revision_id, revision_no, now)
+                self._link_evidence(db, revision_id, int(evidence_row["id"]), now,
+                                    relation_type="MEMORY_CONTROL", details="Explicit user memory edit.")
+                if old_revision:
+                    self._insert_relation(
+                        db, owner_id=owner_id, source_kind="memory_revision", source_uuid=str(old_revision["uuid"]),
+                        target_kind="memory_revision", target_uuid=revision_uuid, relation_type="USER_EDIT",
+                        weight=1.0, details=reason or "Explicit user memory edit.", now=now,
+                    )
+                action = "EDIT"
+                changed = True
+            self._record_memory_event(
+                db, owner_id, idempotency_key, request_hash, memory_uuid, action,
+                int(evidence_row["id"]), int(revision_no), reason or "Explicit user memory edit.", now,
+            )
+        if changed:
+            try:
+                self.vector.upsert(owner_id=owner_id, kind="semantic", uuid=memory_uuid, text=content)
+            except Exception as exc:
+                logger.warning("Brain derived-vector side effect failed: %s: %s", type(exc).__name__, exc)
+        return {"action": action, "memory_uuid": memory_uuid, "revision_no": int(revision_no), "changed": changed}
+
+    def forget_memory_explicit(
+        self, *, owner_id: str, memory_ref: str, external_source_ref: str,
+        session_id: str | None = None, reason: str | None = None,
+    ) -> dict:
+        memory_uuid = self.resolve_memory_uuid(owner_id=owner_id, memory_ref=memory_ref)
+        evidence = self.capture_memory_control_evidence(
+            owner_id=owner_id, raw_text=reason or f"Forget memory {memory_uuid}",
+            external_source_ref=external_source_ref, session_id=session_id,
+            metadata={"action": "FORGET", "memory_uuid": memory_uuid},
+        )
+        revision_no = self.forget_memory(
+            owner_id=owner_id, memory_uuid=memory_uuid, evidence_uuid=str(evidence["evidence_uuid"]),
+            idempotency_key=f"control:forget:{external_source_ref}",
+            reason=reason or "Explicit user memory forget.",
+        )
+        return {"action": "FORGET", "memory_uuid": memory_uuid, "revision_no": revision_no, "changed": True}
+
     def forget_memory(
         self, *, owner_id: str, memory_uuid: str, evidence_uuid: str,
         idempotency_key: str, reason: str | None = None,
@@ -990,12 +1187,6 @@ class BrainMemoryService:
             vector_used = False
 
         hits = sorted(candidates.values(), key=lambda h: (h.score, h.uuid), reverse=True)[:limit]
-        with self.store.write() as db:
-            db.execute(
-                "INSERT INTO recall_events(uuid, owner_id, query, result_count, vector_used, created_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (new_uuid(), owner_id, query, len(hits), 1 if vector_used else 0, utc_now()),
-            )
         return hits
 
     def recall_context(
@@ -1008,6 +1199,8 @@ class BrainMemoryService:
         max_chars: int = 2800,
         include_episodes: bool = True,
         exclude_external_source_refs: Iterable[str] | None = None,
+        external_session_ref: str | None = None,
+        record_event: bool = True,
     ) -> dict:
         # Bounded, provenance-rich recall from authoritative SQLite state.
         owner_id = self._require_text(owner_id, "owner_id")
@@ -1244,7 +1437,30 @@ class BrainMemoryService:
                 separators=(",", ":"),
             )
 
+        vector_candidate_count = sum(
+            1
+            for hit in hits
+            if float((hit.metadata or {}).get("vector_similarity", 0.0) or 0.0) > 0.0
+        )
+        recall_event_uuid = None
+        if record_event:
+            recall_event_uuid = self._record_recall_event(
+                owner_id=owner_id,
+                query=query,
+                result_count=len(hits),
+                vector_used=vector_candidate_count > 0,
+                candidate_count=len(hits),
+                eligible_semantic_count=len(semantic_records),
+                eligible_episode_count=len(episode_records),
+                selected_count=len(selected),
+                selection_mode=selection_mode,
+                selected=selected,
+                context_chars=len(context),
+                external_session_ref=external_session_ref,
+            )
+
         return {
+            "recall_event_uuid": recall_event_uuid,
             "candidate_count": len(hits),
             "eligible_semantic_count": len(semantic_records),
             "eligible_episode_count": len(episode_records),
@@ -1254,16 +1470,92 @@ class BrainMemoryService:
             "context": context,
             "context_chars": len(context),
             "budget_chars": max_chars,
-            "vector_candidate_count": sum(
-                1
-                for hit in hits
-                if float(
-                    (hit.metadata or {}).get(
-                        "vector_similarity", 0.0
-                    ) or 0.0
-                ) > 0.0
-            ),
+            "vector_candidate_count": vector_candidate_count,
         }
+
+    def recall_debug(
+        self,
+        *,
+        owner_id: str,
+        query: str,
+        candidate_limit: int = 16,
+        max_items: int = 6,
+        max_chars: int = 2800,
+        include_episodes: bool = True,
+        exclude_external_source_refs: Iterable[str] | None = None,
+    ) -> dict:
+        return self.recall_context(
+            owner_id=owner_id,
+            query=query,
+            candidate_limit=candidate_limit,
+            max_items=max_items,
+            max_chars=max_chars,
+            include_episodes=include_episodes,
+            exclude_external_source_refs=exclude_external_source_refs,
+            record_event=False,
+        )
+
+    def _record_recall_event(
+        self, *, owner_id: str, query: str, result_count: int, vector_used: bool,
+        candidate_count: int, eligible_semantic_count: int, eligible_episode_count: int,
+        selected_count: int, selection_mode: str, selected: list[dict], context_chars: int,
+        external_session_ref: str | None,
+    ) -> str:
+        event_uuid = new_uuid()
+        with self.store.write() as db:
+            db.execute(
+                "INSERT INTO recall_events("
+                "uuid, owner_id, query, result_count, vector_used, created_at, "
+                "candidate_count, eligible_semantic_count, eligible_episode_count, "
+                "selected_count, selection_mode, selected_json, context_chars, "
+                "injected, injected_at, external_session_ref"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,NULL,?)",
+                (
+                    event_uuid, owner_id, query, int(result_count), 1 if vector_used else 0, utc_now(),
+                    int(candidate_count), int(eligible_semantic_count), int(eligible_episode_count),
+                    int(selected_count), str(selection_mode or "none"), self.store.dump_json(selected),
+                    int(context_chars), str(external_session_ref or "").strip() or None,
+                ),
+            )
+        return event_uuid
+
+    def mark_recall_injected(self, *, owner_id: str, recall_event_uuid: str) -> bool:
+        owner_id = self._require_text(owner_id, "owner_id")
+        recall_event_uuid = self._require_text(recall_event_uuid, "recall_event_uuid")
+        with self.store.write() as db:
+            row = db.execute(
+                "SELECT id, injected FROM recall_events WHERE owner_id=? AND uuid=?",
+                (owner_id, recall_event_uuid),
+            ).fetchone()
+            if row is None:
+                other = db.execute("SELECT owner_id FROM recall_events WHERE uuid=?", (recall_event_uuid,)).fetchone()
+                if other:
+                    raise OwnershipError("recall event does not belong to owner")
+                raise NotFound("recall event not found")
+            if int(row["injected"]):
+                return False
+            db.execute("UPDATE recall_events SET injected=1, injected_at=? WHERE id=?", (utc_now(), int(row["id"])))
+            return True
+
+    def list_recall_events(self, *, owner_id: str, limit: int = 100) -> list[dict]:
+        owner_id = self._require_text(owner_id, "owner_id")
+        limit = max(1, min(int(limit), 500))
+        with self.store.read() as db:
+            rows = db.execute(
+                "SELECT * FROM recall_events WHERE owner_id=? ORDER BY created_at DESC, id DESC LIMIT ?",
+                (owner_id, limit),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["selected"] = json.loads(str(item.pop("selected_json", "[]") or "[]"))
+            except Exception:
+                item["selected"] = []
+            item["vector_used"] = bool(item.get("vector_used"))
+            item["injected"] = bool(item.get("injected"))
+            result.append(item)
+        return result
 
     def _ensure_session(self, db, owner_id: str, external_session_ref: str, *, now: str) -> tuple[int, str]:
         row = db.execute(

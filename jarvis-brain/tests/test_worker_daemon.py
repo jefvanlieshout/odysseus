@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from jarvis_brain.worker_daemon import (
     WorkerDaemonConfig,
+    _check,
     _default_ready_url,
     _model_id_matches,
     _probe_llm,
@@ -14,6 +17,10 @@ from jarvis_brain.worker_daemon import (
     _job_needs_retry_backoff,
     run_daemon,
 )
+
+
+class _HealthyVector:
+    healthy = True
 
 
 class _Action:
@@ -71,6 +78,30 @@ class WorkerDaemonTests(unittest.TestCase):
         self.assertEqual(config.llm_ready_url, "http://127.0.0.1:8000/v1/models")
         self.assertEqual(config.llm_ready_timeout_seconds, 2.0)
         self.assertEqual(config.llm_unavailable_poll_seconds, 10.0)
+
+    def test_check_accepts_the_current_schema_version(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = str(Path(td) / "brain.db")
+            with patch.dict(
+                os.environ,
+                {"BRAIN_DB_PATH": db_path},
+                clear=False,
+            ):
+                config = WorkerDaemonConfig.from_env()
+            emitted = Mock()
+            with (
+                patch(
+                    "jarvis_brain.worker_daemon.build_vector_index_from_env",
+                    return_value=_HealthyVector(),
+                ),
+                patch("jarvis_brain.worker_daemon._emit", emitted),
+            ):
+                _check(config)
+            emitted.assert_called_once()
+            args, kwargs = emitted.call_args
+            self.assertEqual(args[0], "check_ok")
+            from jarvis_brain.schema import SCHEMA_VERSION
+            self.assertEqual(kwargs["schema_version"], SCHEMA_VERSION)
 
     def test_headers_are_parsed_without_changing_types_at_call_boundary(self):
         with patch.dict(

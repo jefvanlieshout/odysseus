@@ -866,13 +866,33 @@ async def build_chat_context(
                 )
             else:
                 messages.append(recall_message)
+            recall_event_uuid = str(packet.get("recall_event_uuid") or "").strip()
+            if recall_event_uuid:
+                try:
+                    from assistant.fork.brain_adapter import brain_mark_recall_injected
+                    receipt = await asyncio.to_thread(
+                        brain_mark_recall_injected,
+                        owner=getattr(sess, "owner", None),
+                        recall_event_uuid=recall_event_uuid,
+                    )
+                    if not receipt.delivered:
+                        logger.warning(
+                            "[brain-recall] event=brain_recall_injection_receipt_error "
+                            "session_id=%s recall_event_uuid=%s error=%s",
+                            session_id, recall_event_uuid, receipt.error,
+                        )
+                except Exception:
+                    logger.warning(
+                        "[brain-recall] event=brain_recall_injection_receipt_error "
+                        "session_id=%s recall_event_uuid=%s error=unexpected_adapter_failure",
+                        session_id, recall_event_uuid, exc_info=True,
+                    )
             logger.info(
                 "[brain-recall] "
                 "event=brain_recall_injected "
-                "session_id=%s selected=%s chars=%s",
-                session_id,
-                packet.get("selected_count", 0),
-                packet.get("context_chars", 0),
+                "session_id=%s selected=%s chars=%s recall_event_uuid=%s",
+                session_id, packet.get("selected_count", 0), packet.get("context_chars", 0),
+                recall_event_uuid or None,
             )
 
     # Current date/time — injected as a standalone *user*-role context message

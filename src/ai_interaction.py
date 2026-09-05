@@ -352,30 +352,24 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
       delete                  — line 2: memory_id
       search                  — line 2: query
     """
-    # `memory_enabled` is the master switch for the legacy/native memory
-    # system. Brain capture/recall have their own independent gates. Keeping
-    # this check at the tool implementation boundary prevents a model from
-    # bypassing the native-memory toggle by calling manage_memory directly.
+    # Native stays the default rollback backend until Brain is explicitly selected.
     try:
         from routes.prefs_routes import _load_for_user as _load_memory_prefs
-        if not _load_memory_prefs(owner).get("memory_enabled", True):
-            return {
-                "error": (
-                    "Native Odysseus memory is disabled for this user. "
-                    "No native memory operation was performed."
-                )
-            }
+        memory_prefs = _load_memory_prefs(owner)
     except Exception:
-        logger.warning(
-            "Could not verify native memory preference; blocking manage_memory",
-            exc_info=True,
+        logger.warning("Could not verify memory backend preference; blocking manage_memory", exc_info=True)
+        return {"error": "Could not verify the memory backend preference; no memory operation was performed."}
+
+    memory_backend = str(memory_prefs.get("memory_backend", "native") or "native").strip().casefold()
+    if memory_backend == "brain":
+        from assistant.fork.brain_adapter import brain_manage_memory
+        return await asyncio.to_thread(
+            brain_manage_memory, owner=owner, session_id=session_id, content=content,
         )
-        return {
-            "error": (
-                "Could not verify the native memory preference; "
-                "no memory operation was performed."
-            )
-        }
+    if memory_backend != "native":
+        return {"error": f"Unsupported memory backend {memory_backend!r}; no memory operation was performed."}
+    if not memory_prefs.get("memory_enabled", True):
+        return {"error": "Native Odysseus memory is disabled for this user. No native memory operation was performed."}
 
     if not _memory_manager:
         return {"error": "Memory manager not available"}
@@ -538,6 +532,9 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
             text = m.get("text", "")
             result_lines.append(f"- [{cat}] `{mid}` — {text}")
         return {"results": "\n".join(result_lines)}
+
+    elif action == "history":
+        return {"error": "Memory history is available only when memory_backend is set to Brain."}
 
     else:
         return {"error": f"Unknown action '{action}'. Use: list, add, edit, delete, search"}

@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from .service import BrainError, BrainMemoryService, IdempotencyConflict, OwnershipError
+from .service import BrainError, BrainMemoryService, IdempotencyConflict, NotFound, OwnershipError
 from .types import SourceKind
 
 MAX_REQUEST_BYTES = 1024 * 1024
@@ -148,15 +148,95 @@ class BrainAPIHandler(BaseHTTPRequestHandler):
                     exclude_external_source_refs=body.get(
                         "exclude_external_source_refs"
                     ),
+                    external_session_ref=body.get("external_session_ref"),
                 )
                 self._json(HTTPStatus.OK, {"ok": True, **result})
                 return
+            if path == "/v1/recall/debug":
+                result = self.server.service.recall_debug(
+                    owner_id=body.get("owner_id"), query=body.get("query"),
+                    candidate_limit=body.get("candidate_limit", 16), max_items=body.get("max_items", 6),
+                    max_chars=body.get("max_chars", 2800), include_episodes=body.get("include_episodes", True),
+                    exclude_external_source_refs=body.get("exclude_external_source_refs"),
+                )
+                self._json(HTTPStatus.OK, {"ok": True, **result})
+                return
+            if path == "/v1/recall/mark-injected":
+                changed = self.server.service.mark_recall_injected(
+                    owner_id=body.get("owner_id"), recall_event_uuid=body.get("recall_event_uuid"),
+                )
+                self._json(HTTPStatus.OK, {"ok": True, "changed": changed})
+                return
+            if path == "/v1/recall/events":
+                events = self.server.service.list_recall_events(
+                    owner_id=body.get("owner_id"), limit=body.get("limit", 100),
+                )
+                self._json(HTTPStatus.OK, {"ok": True, "events": events})
+                return
+            if path == "/v1/memory/manage":
+                action = str(body.get("action") or "").strip().casefold()
+                owner_id = body.get("owner_id")
+                if action == "list":
+                    memories = self.server.service.list_memories(
+                        owner_id=owner_id, include_forgotten=bool(body.get("include_forgotten", False)),
+                    )
+                    memory_type = str(body.get("memory_type") or "").strip().casefold()
+                    if memory_type:
+                        memories = [m for m in memories if str(m.get("memory_type") or "").casefold() == memory_type]
+                    self._json(HTTPStatus.OK, {"ok": True, "memories": memories})
+                    return
+                if action == "search":
+                    hits = self.server.service.search(
+                        owner_id=owner_id, query=body.get("query"), limit=body.get("limit", 20), include_episodes=False,
+                    )
+                    self._json(HTTPStatus.OK, {
+                        "ok": True,
+                        "hits": [{"kind": h.kind, "uuid": h.uuid, "text": h.text, "score": h.score, "metadata": h.metadata}
+                                 for h in hits if h.kind == "semantic"],
+                    })
+                    return
+                if action == "history":
+                    memory_uuid = self.server.service.resolve_memory_uuid(
+                        owner_id=owner_id, memory_ref=body.get("memory_ref"),
+                    )
+                    self._json(HTTPStatus.OK, {
+                        "ok": True, "memory_uuid": memory_uuid,
+                        "history": self.server.service.memory_history(owner_id=owner_id, memory_uuid=memory_uuid),
+                        "events": self.server.service.memory_events(owner_id=owner_id, memory_uuid=memory_uuid),
+                        "evidence": self.server.service.memory_evidence(owner_id=owner_id, memory_uuid=memory_uuid),
+                    })
+                    return
+                if action == "add":
+                    result = self.server.service.create_memory_explicit(
+                        owner_id=owner_id, content=body.get("text"), memory_type=body.get("memory_type") or "fact",
+                        external_source_ref=body.get("external_source_ref"), session_id=body.get("session_id"),
+                        scope=body.get("scope") or "explicit", reason=body.get("reason"),
+                    )
+                    self._json(HTTPStatus.OK, {"ok": True, **result})
+                    return
+                if action == "edit":
+                    result = self.server.service.update_memory_explicit(
+                        owner_id=owner_id, memory_ref=body.get("memory_ref"), content=body.get("text"),
+                        external_source_ref=body.get("external_source_ref"), session_id=body.get("session_id"),
+                        reason=body.get("reason"),
+                    )
+                    self._json(HTTPStatus.OK, {"ok": True, **result})
+                    return
+                if action in {"delete", "forget"}:
+                    result = self.server.service.forget_memory_explicit(
+                        owner_id=owner_id, memory_ref=body.get("memory_ref"),
+                        external_source_ref=body.get("external_source_ref"), session_id=body.get("session_id"),
+                        reason=body.get("reason"),
+                    )
+                    self._json(HTTPStatus.OK, {"ok": True, **result})
+                    return
+                raise ValueError("memory action must be list, search, history, add, edit, delete, or forget")
             if path == "/v1/rebuild-index":
                 result = self.server.service.rebuild_vector_index(owner_id=body.get("owner_id"))
                 self._json(HTTPStatus.OK, {"ok": True, **result})
                 return
             self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
-        except OwnershipError:
+        except (OwnershipError, NotFound):
             self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
         except IdempotencyConflict as exc:
             self._json(HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)})

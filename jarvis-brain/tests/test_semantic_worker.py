@@ -125,7 +125,7 @@ class SemanticWorkerTests(unittest.TestCase):
             )
         return result.memory_uuid
 
-    def test_v2_database_migrates_to_v3_job_lease_columns(self):
+    def test_v2_database_migrates_to_v4_job_lease_and_recall_columns(self):
         old = Path(self.tmp.name) / "v2.db"
         db = sqlite3.connect(old)
         db.executescript(V1_DDL)
@@ -136,9 +136,12 @@ class SemanticWorkerTests(unittest.TestCase):
         db.execute("INSERT INTO brain_meta(key,value) VALUES('schema_version','2')")
         db.commit(); db.close()
         migrated = BrainMemoryService(old)
-        self.assertEqual(migrated.store.schema_version(), 3)
+        self.assertEqual(migrated.store.schema_version(), 4)
         with migrated.store.read() as db2:
             columns = {row[1] for row in db2.execute("PRAGMA table_info(semantic_jobs)")}
+        with migrated.store.read() as db3:
+            recall_columns = {row[1] for row in db3.execute("PRAGMA table_info(recall_events)")}
+        self.assertTrue({"selected_json", "injected", "selection_mode"} <= recall_columns)
         self.assertTrue({
             "lease_token", "lease_expires_at", "next_attempt_at",
             "plan_json", "result_json", "finished_at",

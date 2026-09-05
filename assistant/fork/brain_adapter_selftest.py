@@ -67,12 +67,13 @@ def _start_server():
     return server, thread
 
 
-def _config(server, mode="shadow", *, capture_enabled=True, recall_enabled=True):
+def _config(server, mode="shadow", *, capture_enabled=True, recall_enabled=True, control_enabled=False):
     host, port = server.server_address
     return BrainAdapterConfig(
         mode=mode,
         capture_enabled=capture_enabled,
         recall_enabled=recall_enabled,
+        control_enabled=control_enabled,
         base_url=f"http://{host}:{port}",
         api_key="k" * 40,
         timeout_seconds=1.0,
@@ -143,6 +144,7 @@ def main() -> None:
         server.reply_status = 200
         server.reply_payload = {
             "ok": True,
+            "recall_event_uuid": "recall-event-1",
             "candidate_count": 3,
             "eligible_semantic_count": 1,
             "eligible_episode_count": 1,
@@ -181,6 +183,27 @@ def main() -> None:
             ]
             == ["current-message"]
         )
+
+        assert recall.packet["recall_event_uuid"] == "recall-event-1"
+        server.reply_payload = {"ok": True, "changed": True}
+        receipt = recall_adapter.mark_recall_injected(owner="jef", recall_event_uuid="recall-event-1")
+        assert receipt.delivered
+        assert server.requests[-1]["path"] == "/v1/recall/mark-injected"
+
+        server.reply_payload = {
+            "ok": True,
+            "memories": [{
+                "uuid": "12345678-1234-1234-1234-123456789abc",
+                "memory_type": "preference",
+                "status": "current",
+                "current_content": "The user prefers purple.",
+            }],
+        }
+        control_adapter = BrainMemoryAdapter(_config(server, mode="recall", control_enabled=True))
+        managed = control_adapter.manage_memory(owner="jef", session_id="s", content="list")
+        assert managed["backend"] == "brain"
+        assert "12345678" in managed["results"]
+        assert server.requests[-1]["path"] == "/v1/memory/manage"
 
         before_recall = len(server.requests)
         shadow_only = BrainMemoryAdapter(
@@ -310,12 +333,14 @@ def main() -> None:
             {
                 "ASSISTANT_BRAIN_CAPTURE_ENABLED": "0",
                 "ASSISTANT_BRAIN_RECALL_ENABLED": "off",
+                "ASSISTANT_BRAIN_CONTROL_ENABLED": "1",
             },
             clear=False,
         ):
             cfg = BrainAdapterConfig.from_env()
             assert not cfg.capture_enabled
             assert not cfg.recall_enabled
+            assert cfg.control_enabled
 
         # Environment helper stays off by default.
         with patch.dict(os.environ, {}, clear=True):
@@ -365,6 +390,8 @@ def main() -> None:
             in build_body
         )
         assert "brain_recall_injected" in build_body
+        assert "brain_mark_recall_injected" in build_body
+        assert "recall_event_uuid" in build_body
         assert build_body.index(
             '"Jarvis Brain recall"'
         ) < build_body.index(

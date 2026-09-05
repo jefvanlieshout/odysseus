@@ -115,7 +115,7 @@ class BrainFoundationTests(unittest.TestCase):
 
     def test_schema_and_pragmas(self):
         self.assertEqual(self.brain.store.schema_version(), SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 3)
+        self.assertEqual(SCHEMA_VERSION, 4)
         with self.brain.store.read() as db:
             self.assertEqual(int(db.execute("PRAGMA foreign_keys").fetchone()[0]), 1)
             self.assertEqual(str(db.execute("PRAGMA journal_mode").fetchone()[0]).casefold(), "wal")
@@ -124,18 +124,20 @@ class BrainFoundationTests(unittest.TestCase):
             evidence_columns = {r[1] for r in db.execute("PRAGMA table_info(evidence)")}
             self.assertIn("message_id", evidence_columns)
 
-    def test_v1_database_migrates_explicitly_to_v3(self):
+    def test_v1_database_migrates_explicitly_to_v4(self):
         old = Path(self.tmp.name) / "v1.db"
         db = sqlite3.connect(old)
         db.executescript(V1_DDL)
         db.execute("INSERT INTO brain_meta(key,value) VALUES('schema_version','1')")
         db.commit(); db.close()
         migrated = BrainMemoryService(old)
-        self.assertEqual(migrated.store.schema_version(), 3)
+        self.assertEqual(migrated.store.schema_version(), SCHEMA_VERSION)
         with migrated.store.read() as db2:
             tables = {r[0] for r in db2.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertIn("semantic_commits", tables)
             job_columns = {r[1] for r in db2.execute("PRAGMA table_info(semantic_jobs)")}
+            recall_columns = {r[1] for r in db2.execute("PRAGMA table_info(recall_events)")}
+            self.assertTrue({"selected_json", "injected", "selection_mode"} <= recall_columns)
             self.assertTrue({"lease_token", "lease_expires_at", "plan_json", "result_json"} <= job_columns)
 
     def test_future_schema_fails_closed(self):

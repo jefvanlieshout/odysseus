@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 from jarvis_brain import BrainMemoryService, build_vector_index_from_env
 from jarvis_brain.llm_reasoner import OpenAIJsonReasoner, StructuredReasonerConfig
 from jarvis_brain.semantic_worker import SemanticWorker
+from jarvis_brain.schema import SCHEMA_VERSION
 
 
 def _env_float(name: str, default: float, *, minimum: float | None = None) -> float:
@@ -299,8 +300,10 @@ def _check(config: WorkerDaemonConfig) -> None:
             ).fetchone()[0]
         )
         integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
-    if schema_version != 3:
-        raise RuntimeError(f"expected Brain schema v3, got v{schema_version}")
+    if schema_version != SCHEMA_VERSION:
+        raise RuntimeError(
+            f"expected Brain schema v{SCHEMA_VERSION}, got v{schema_version}"
+        )
     if integrity != "ok":
         raise RuntimeError(f"SQLite integrity_check failed: {integrity}")
     _emit(

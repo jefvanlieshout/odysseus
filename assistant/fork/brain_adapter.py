@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+import uuid
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -53,6 +54,7 @@ class BrainAdapterConfig:
     default_owner: str = "local"
     capture_enabled: bool = True
     recall_enabled: bool = True
+    control_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "BrainAdapterConfig":
@@ -95,6 +97,7 @@ class BrainAdapterConfig:
             ).strip().casefold(),
             capture_enabled=_env_flag("ASSISTANT_BRAIN_CAPTURE_ENABLED", True),
             recall_enabled=_env_flag("ASSISTANT_BRAIN_RECALL_ENABLED", True),
+            control_enabled=_env_flag("ASSISTANT_BRAIN_CONTROL_ENABLED", False),
             base_url=str(
                 os.environ.get("JARVIS_BRAIN_URL", "") or ""
             ).strip().rstrip("/"),
@@ -119,7 +122,8 @@ class BrainAdapterConfig:
             return f"unsupported Brain mode: {self.mode!r}"
         active_capture = self.capture_enabled and self.mode in {"shadow", "recall"}
         active_recall = self.recall_enabled and self.mode == "recall"
-        if self.mode == "off" or not (active_capture or active_recall):
+        active_control = self.control_enabled and self.mode in {"shadow", "recall"}
+        if self.mode == "off" or not (active_capture or active_recall or active_control):
             return None
         if not self.default_owner:
             return "ASSISTANT_BRAIN_DEFAULT_OWNER must not be empty"
@@ -365,6 +369,7 @@ class BrainMemoryAdapter:
         exclude_external_source_refs: (
             list[str] | tuple[str, ...]
         ) = (),
+        external_session_ref: str | None = None,
     ) -> BrainRecallResult:
         # Fetch bounded reference context for one live user turn.
         if self.config.mode != "recall" or not self.config.recall_enabled:
@@ -403,6 +408,7 @@ class BrainMemoryAdapter:
                 "max_chars": self.config.recall_max_chars,
                 "include_episodes": True,
                 "exclude_external_source_refs": excluded,
+                "external_session_ref": str(external_session_ref or "").strip() or None,
             },
             timeout_seconds=self.config.recall_timeout_seconds,
         )
@@ -434,6 +440,7 @@ class BrainMemoryAdapter:
             )
 
         packet = {
+            "recall_event_uuid": (str(decoded.get("recall_event_uuid") or "").strip() or None),
             "candidate_count": int(
                 decoded.get("candidate_count") or 0
             ),
@@ -472,6 +479,114 @@ class BrainMemoryAdapter:
             True, True, packet, "/v1/recall",
             request_result.status_code, None
         )
+
+    def mark_recall_injected(self, *, owner: str | None, recall_event_uuid: str) -> ShadowCaptureResult:
+        if self.config.mode != "recall" or not self.config.recall_enabled:
+            return ShadowCaptureResult(False, False, None, None, "disabled")
+        error = self.config.validation_error()
+        if error:
+            return ShadowCaptureResult(False, False, None, None, error)
+        event_uuid = str(recall_event_uuid or "").strip()
+        if not event_uuid:
+            return ShadowCaptureResult(False, False, None, None, "missing recall event")
+        result, _decoded = self._post_json_payload(
+            "/v1/recall/mark-injected",
+            {"owner_id": self._owner(owner, self.config.default_owner), "recall_event_uuid": event_uuid},
+            timeout_seconds=self.config.timeout_seconds,
+        )
+        return result
+
+    def manage_memory(self, *, owner: str | None, session_id: str | None, content: str) -> dict[str, Any]:
+        if self.config.mode == "off" or not self.config.control_enabled:
+            return {"error": "Jarvis Brain memory control is disabled; no memory operation was performed."}
+        error = self.config.validation_error()
+        if error:
+            return {"error": error}
+        lines = str(content or "").strip().splitlines()
+        if not lines:
+            return {"error": "Need at least 1 line: action"}
+        action = lines[0].strip().casefold()
+        payload: dict[str, Any] = {
+            "owner_id": self._owner(owner, self.config.default_owner),
+            "action": action,
+            "session_id": str(session_id or "").strip() or None,
+        }
+        if action == "list":
+            if len(lines) > 1 and lines[1].strip():
+                payload["memory_type"] = lines[1].strip().casefold()
+        elif action == "search":
+            if len(lines) < 2 or not lines[1].strip():
+                return {"error": "Search needs line 2: query"}
+            payload["query"] = lines[1].strip()
+        elif action == "history":
+            if len(lines) < 2 or not lines[1].strip():
+                return {"error": "History needs line 2: memory_id"}
+            payload["memory_ref"] = lines[1].strip()
+        elif action == "add":
+            if len(lines) < 2 or not lines[1].strip():
+                return {"error": "Add needs line 2: memory text"}
+            payload["text"] = lines[1].strip()
+            payload["memory_type"] = lines[2].strip().casefold() if len(lines) > 2 and lines[2].strip() else "fact"
+            payload["external_source_ref"] = f"gwen-control-add-{uuid.uuid4()}"
+            payload["reason"] = "Explicit memory add requested through Gwen."
+        elif action == "edit":
+            if len(lines) < 3 or not lines[1].strip() or not lines[2].strip():
+                return {"error": "Edit needs line 2: memory_id, line 3: new text"}
+            payload["memory_ref"] = lines[1].strip()
+            payload["text"] = lines[2].strip()
+            payload["external_source_ref"] = f"gwen-control-edit-{uuid.uuid4()}"
+            payload["reason"] = "Explicit memory edit requested through Gwen."
+        elif action in {"delete", "forget"}:
+            if len(lines) < 2 or not lines[1].strip():
+                return {"error": "Delete needs line 2: memory_id"}
+            payload["action"] = "forget"
+            payload["memory_ref"] = lines[1].strip()
+            payload["external_source_ref"] = f"gwen-control-forget-{uuid.uuid4()}"
+            payload["reason"] = "Explicit memory forget requested through Gwen."
+        else:
+            return {"error": "Brain memory action must be list, search, history, add, edit, delete, or forget"}
+        request_result, decoded = self._post_json_payload(
+            "/v1/memory/manage", payload, timeout_seconds=max(self.config.timeout_seconds, 2.0)
+        )
+        if not request_result.delivered or not isinstance(decoded, dict):
+            return {"error": request_result.error or "Brain memory request failed", "status_code": request_result.status_code}
+        if action == "list":
+            memories = decoded.get("memories")
+            if not isinstance(memories, list) or not memories:
+                return {"backend": "brain", "results": "No Brain memories found."}
+            rows = [f"Found {len(memories)} Brain memory entries:\n"]
+            for item in memories:
+                if not isinstance(item, dict):
+                    continue
+                mid = str(item.get("uuid") or "?")[:8]
+                mtype = str(item.get("memory_type") or "other")
+                status = str(item.get("status") or "current")
+                text = str(item.get("current_content") or "")
+                if len(text) > 180:
+                    text = text[:180] + "..."
+                rows.append(f"- [{mtype}/{status}] `{mid}` — {text}")
+            return {"backend": "brain", "memories": memories, "results": "\n".join(rows)}
+        if action == "search":
+            hits = decoded.get("hits")
+            if not isinstance(hits, list) or not hits:
+                return {"backend": "brain", "results": "No matching Brain memories found."}
+            rows = [f"Found {len(hits)} matching Brain memories:\n"]
+            for hit in hits:
+                if isinstance(hit, dict):
+                    rows.append(f"- `{str(hit.get('uuid') or '?')[:8]}` — {str(hit.get('text') or '')}")
+            return {"backend": "brain", "hits": hits, "results": "\n".join(rows)}
+        if action == "history":
+            history = decoded.get("history")
+            rows = [f"Brain history for `{str(decoded.get('memory_uuid') or '')[:8]}`:"]
+            for revision in history if isinstance(history, list) else []:
+                if isinstance(revision, dict):
+                    rows.append(f"- r{revision.get('revision_no')} {revision.get('operation')}: {revision.get('content')}")
+            return {"backend": "brain", **decoded, "results": "\n".join(rows)}
+        memory_uuid = str(decoded.get("memory_uuid") or "")
+        return {
+            "backend": "brain", **decoded, "memory_id": memory_uuid,
+            "results": f"Brain memory {decoded.get('action', action)}: `{memory_uuid[:8]}`",
+        }
 
     def capture_persisted_message(
         self,
@@ -573,6 +688,7 @@ def brain_recall_for_prompt(
         exclude_external_source_refs=(
             exclude_external_source_refs
         ),
+        external_session_ref=session_id,
     )
 
     if result.delivered and result.packet is not None:
@@ -621,6 +737,21 @@ def brain_recall_for_prompt(
             owner_id, session_id, result.error,
         )
     return result
+
+def brain_mark_recall_injected(*, owner: str | None, recall_event_uuid: str) -> ShadowCaptureResult:
+    adapter = BrainMemoryAdapter(BrainAdapterConfig.from_env())
+    result = adapter.mark_recall_injected(owner=owner, recall_event_uuid=recall_event_uuid)
+    if result.attempted and not result.delivered:
+        logger.warning(
+            "[brain-recall] event=brain_recall_injection_receipt_error status=%s error=%s",
+            result.status_code, result.error,
+        )
+    return result
+
+
+def brain_manage_memory(*, owner: str | None, session_id: str | None, content: str) -> dict[str, Any]:
+    adapter = BrainMemoryAdapter(BrainAdapterConfig.from_env())
+    return adapter.manage_memory(owner=owner, session_id=session_id, content=content)
 
 def shadow_persisted_message(**kwargs) -> ShadowCaptureResult:
     """Environment-configured one-shot shadow mirror.
