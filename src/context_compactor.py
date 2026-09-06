@@ -289,31 +289,80 @@ def trim_for_context(messages: List[Dict], context_length: int, reserve_tokens: 
             if estimate_tokens(trimmed) <= budget:
                 return _sanitize_tool_messages(essential_system + protected_msgs + convo_msgs)
 
-    # Still too big — drop older conversation turns BUT always keep the current
-    # user turn. If a pasted message alone exceeds the model context, truncate
-    # that message with a visible notice instead of dropping it; otherwise the
-    # model appears to "ignore" large pastes because it never receives them.
-    # Hermes-style: recent context matters more than old context.
+    # Still too big — drop older conversation turns BUT always keep the latest
+    # USER turn and everything after it. During an agent round the final
+    # message is commonly role="tool", not role="user". Treating the final
+    # tool result as the "current message" can otherwise drop the user query,
+    # orphan the tool exchange, and make chat templates fail with errors such
+    # as "No user query found in messages.".
+    # Hermes-style: the active user turn + tool exchange matter more than old
+    # conversation context.
     PROTECT_RECENT = 10
-    current_msg = convo_msgs[-1:] if convo_msgs else []
-    prior_convo = convo_msgs[:-1] if convo_msgs else []
-    if len(prior_convo) >= PROTECT_RECENT:
-        old_msgs = prior_convo[:-(PROTECT_RECENT - 1)]
-        recent_msgs = prior_convo[-(PROTECT_RECENT - 1):] + current_msg
-        while old_msgs and estimate_tokens(essential_system + old_msgs + recent_msgs) > budget:
-            old_msgs.pop(0)
-        convo_msgs = old_msgs + recent_msgs
-    else:
-        convo_msgs = prior_convo + current_msg
-        while prior_convo and estimate_tokens(essential_system + prior_convo + current_msg) > budget:
-            prior_convo.pop(0)
-        convo_msgs = prior_convo + current_msg
+    latest_user_index = next(
+        (
+            i
+            for i in range(len(convo_msgs) - 1, -1, -1)
+            if convo_msgs[i].get("role") == "user"
+        ),
+        None,
+    )
 
-    # If the current message itself is too large, shrink only that message.
-    if current_msg and estimate_tokens(essential_system + protected_msgs + convo_msgs) > budget:
-        prefix = essential_system + protected_msgs + convo_msgs[:-1]
-        available_for_current = max(64, budget - estimate_tokens(prefix))
-        convo_msgs[-1] = _truncate_message_to_token_budget(convo_msgs[-1], available_for_current)
+    if latest_user_index is None:
+        current_turn = convo_msgs[-1:] if convo_msgs else []
+        prior_convo = convo_msgs[:-1] if convo_msgs else []
+    else:
+        current_turn = convo_msgs[latest_user_index:]
+        prior_convo = convo_msgs[:latest_user_index]
+
+    if len(prior_convo) > PROTECT_RECENT:
+        prior_convo = prior_convo[-PROTECT_RECENT:]
+    while prior_convo and estimate_tokens(
+        essential_system + protected_msgs + prior_convo + current_turn
+    ) > budget:
+        prior_convo.pop(0)
+
+    convo_msgs = prior_convo + current_turn
+
+    # A tool result can itself be enormous (for example an RRD time series).
+    # If the active turn still exceeds the budget, truncate messages *inside*
+    # that turn rather than deleting its user query. Preserve the user message
+    # first, then share the remaining budget across assistant/tool messages so
+    # tool-call/result pairing survives _sanitize_tool_messages().
+    if current_turn and estimate_tokens(
+        essential_system + protected_msgs + convo_msgs
+    ) > budget:
+        prefix = essential_system + protected_msgs + prior_convo
+        available_for_turn = max(128, budget - estimate_tokens(prefix))
+
+        if latest_user_index is not None:
+            user_budget = min(
+                available_for_turn,
+                max(128, min(2048, available_for_turn // 4)),
+            )
+            shrunk_turn = [
+                _truncate_message_to_token_budget(current_turn[0], user_budget)
+            ]
+            remainder = current_turn[1:]
+            if remainder:
+                remaining_budget = max(
+                    64,
+                    available_for_turn - estimate_tokens(shrunk_turn),
+                )
+                per_message = max(64, remaining_budget // len(remainder))
+                shrunk_turn.extend(
+                    _truncate_message_to_token_budget(message, per_message)
+                    for message in remainder
+                )
+            current_turn = shrunk_turn
+        else:
+            current_turn = [
+                _truncate_message_to_token_budget(
+                    current_turn[-1],
+                    available_for_turn,
+                )
+            ]
+
+        convo_msgs = prior_convo + current_turn
 
     result = _sanitize_tool_messages(essential_system + protected_msgs + convo_msgs)
     logger.info(f"Trimmed to {estimate_tokens(result)} tokens ({len(result)} messages)")

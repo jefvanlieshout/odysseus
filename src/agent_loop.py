@@ -563,7 +563,8 @@ _DOMAIN_RULES = {
 - Do NOT use `manage_memory` for contact lookups — contact details live in the address book, not memory.""",
     "integrations": """\
 ## Integration/API rules
-- For Proxmox VE status, guests, storage, tasks, or diagnostics, use the dedicated read-only `proxmox` tool.
+- For Proxmox VE status, guests, guest metrics/history, storage, tasks, or diagnostics, use the dedicated read-only `proxmox` tool.
+- For KuCoin grid-bot status, anchor-valued P&L, fills, fees, or telemetry history, use the dedicated read-only `kucoin_bot` tool. It never places/cancels trades and never fetches a live market price.
 - To query or control another configured service integration (Home Assistant, Miniflux, Gitea, Linkding, Jellyfin, or any other registered service), use `api_call` with the integration name, HTTP method, path, and optional JSON body.
 - Do not use shell, curl, or `app_api` to reach a user's connected integration when a named integration tool or `api_call` is available.""",
 }
@@ -579,7 +580,7 @@ _DOMAIN_TOOL_MAP = {
     "files": {"bash", "python", "read_file", "write_file", "edit_file", "apply_patch", "todowrite", "grep", "glob", "ls", "get_workspace", "inspect_code", "manage_bg_jobs"},
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
     "contacts": {"resolve_contact", "manage_contact"},
-    "integrations": {"api_call", "proxmox"},
+    "integrations": {"api_call", "proxmox", "kucoin_bot"},
 }
 
 _WORKSPACE_TERMINUS_TOOLS = (
@@ -1565,7 +1566,8 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     # "integrations" domain seeds api_call deterministically (see
     # _DOMAIN_TOOL_MAP), independent of embedding retrieval.
     if has(r"\bapi[ _]call\b", r"\bintegrations?\b",
-           r"\b(?:home ?assistant|miniflux|gitea|linkding|jellyfin)\b"):
+           r"\b(?:home ?assistant|miniflux|gitea|linkding|jellyfin|proxmox)\b",
+           r"\bkucoin\b.{0,24}\b(?:grid ?bot|bot|telemetry|profit|p&l|pnl)\b"):
         domains.add("integrations")
 
     low_signal = not continuation and not domains

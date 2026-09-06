@@ -154,6 +154,19 @@ INTEGRATION_PRESETS: Dict[str, Dict[str, Any]] = {
             "PVEAuditor token. Non-GET generic api_call requests are blocked."
         ),
     },
+    "kucoin_bot_telemetry": {
+        "name": "KuCoin Grid Bot Telemetry",
+        "auth_type": "header",
+        "auth_header": "Authorization",
+        "description": (
+            "Read-only telemetry sidecar for the KuCoin grid bot. Use the dedicated "
+            "kucoin_bot tool for status, anchor-valued performance, activity history, "
+            "and diagnostics. Base URL: http://BOT_LXC_IP:8766. API key value: "
+            "Bearer TOKEN. The sidecar never talks to KuCoin, never exposes trading "
+            "credentials, never places/cancels orders, and never uses a live market "
+            "price. Non-GET generic api_call requests are blocked."
+        ),
+    },
     "freshrss": {
         "name": "FreshRSS",
         "auth_type": "header",
@@ -543,9 +556,19 @@ async def execute_api_call(
     preset = (integration.get("preset") or integration.get("name", "")).lower()
 
     is_proxmox = preset == "proxmox" or "proxmox" in str(integration.get("name") or "").casefold()
-    if is_proxmox and str(method or "").upper() != "GET":
+    integration_name = str(integration.get("name") or "").casefold()
+    is_kucoin_telemetry = (
+        preset == "kucoin_bot_telemetry"
+        or ("kucoin" in integration_name and "telemetry" in integration_name)
+    )
+    if (is_proxmox or is_kucoin_telemetry) and str(method or "").upper() != "GET":
+        label = (
+            "Proxmox"
+            if is_proxmox
+            else "KuCoin Grid Bot Telemetry"
+        )
         return {
-            "error": "Proxmox integration is read-only: only GET requests are allowed.",
+            "error": f"{label} integration is read-only: only GET requests are allowed.",
             "exit_code": 1,
         }
 

@@ -1,0 +1,26 @@
+[Unit]
+Description=KuCoin grid bot read-only telemetry
+After=network.target kucoin-grid-bot.service
+Wants=kucoin-grid-bot.service
+
+[Service]
+Type=simple
+User=gridbot
+Group=gridbot
+ExecStart=/opt/kucoin-grid-bot/.venv/bin/python /opt/kucoin-grid-bot-telemetry/telemetry.py --listen 0.0.0.0 --port 8766
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/kucoin-grid-bot /opt/kucoin-grid-bot /opt/kucoin-grid-bot-telemetry
+ReadOnlyPaths=/var/lib/kucoin-grid-bot
+ReadWritePaths=/var/lib/kucoin-grid-bot-telemetry
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

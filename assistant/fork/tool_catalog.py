@@ -59,7 +59,7 @@ DOMAIN_ANCHORS: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "ui": ("ui_control",),
     "sessions": ("list_sessions", "manage_session", "search_chats"),
     "settings": ("manage_settings", "manage_mcp", "manage_endpoints"),
-    "integrations": ("api_call",),
+    "integrations": ("api_call", "proxmox", "kucoin_bot"),
     # Dynamic builtin-browser MCP bare names:
     "browser": (
         "browser_navigate",

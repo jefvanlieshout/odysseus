@@ -19,6 +19,7 @@ from src.url_safety import _default_resolver, check_outbound_url
 
 _MAX_TASKS = 100
 _WARN_STORAGE_PERCENT = 85.0
+_MAX_RRD_RETURNED_SAMPLES = 48
 
 
 def _parse_args(content: str) -> Dict[str, Any]:
@@ -210,6 +211,131 @@ def _resource_summary(resource: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _guest_identity(guest: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "vmid": guest.get("vmid"),
+        "name": guest.get("name"),
+        "type": guest.get("type"),
+        "node": guest.get("node"),
+    }
+
+
+def _guest_status_summary(status: Any) -> Dict[str, Any]:
+    data = status if isinstance(status, dict) else {}
+    summary: Dict[str, Any] = {
+        "status": data.get("status"),
+        "uptime_seconds": data.get("uptime"),
+        "cpu_percent": _cpu_pct(data.get("cpu")),
+        "cpu_count": data.get("cpus") or data.get("maxcpu"),
+        "memory_used": data.get("mem"),
+        "memory_total": data.get("maxmem"),
+        "memory_percent": _pct(data.get("mem"), data.get("maxmem")),
+        "swap_used": data.get("swap"),
+        "swap_total": data.get("maxswap"),
+        "swap_percent": _pct(data.get("swap"), data.get("maxswap")),
+        "disk_used": data.get("disk"),
+        "disk_total": data.get("maxdisk"),
+        "disk_percent": _pct(data.get("disk"), data.get("maxdisk")),
+        "network_in_bytes": data.get("netin"),
+        "network_out_bytes": data.get("netout"),
+        "disk_read_bytes": data.get("diskread"),
+        "disk_write_bytes": data.get("diskwrite"),
+        "tags": data.get("tags"),
+    }
+    pressure = {
+        key.removeprefix("pressure"): data.get(key)
+        for key in (
+            "pressurecpusome",
+            "pressurecpufull",
+            "pressurememorysome",
+            "pressurememoryfull",
+            "pressureiosome",
+            "pressureiofull",
+        )
+        if data.get(key) is not None
+    }
+    if pressure:
+        summary["pressure"] = pressure
+
+    warnings: list[str] = []
+    if summary["memory_percent"] >= 90:
+        warnings.append(f"Memory usage is {summary['memory_percent']:.1f}%.")
+    if summary["disk_percent"] >= 90:
+        warnings.append(f"Disk usage is {summary['disk_percent']:.1f}%.")
+    if summary["swap_percent"] >= 50:
+        warnings.append(f"Swap usage is {summary['swap_percent']:.1f}%.")
+    summary["warnings"] = warnings
+    return summary
+
+
+def _rrd_sample_summary(sample: Any) -> Dict[str, Any]:
+    row = sample if isinstance(sample, dict) else {}
+    return {
+        "timestamp": row.get("time"),
+        "cpu_percent": _cpu_pct(row.get("cpu")),
+        "memory_used": row.get("mem"),
+        "memory_total": row.get("maxmem"),
+        "memory_percent": _pct(row.get("mem"), row.get("maxmem")),
+        "disk_used": row.get("disk"),
+        "disk_total": row.get("maxdisk"),
+        "disk_percent": _pct(row.get("disk"), row.get("maxdisk")),
+        "network_in_rate": row.get("netin"),
+        "network_out_rate": row.get("netout"),
+        "disk_read_rate": row.get("diskread"),
+        "disk_write_rate": row.get("diskwrite"),
+    }
+
+
+def _metric_summary(samples: list[Dict[str, Any]]) -> Dict[str, Any]:
+    def values(key: str) -> list[float]:
+        return [_num(sample.get(key)) for sample in samples if sample.get(key) is not None]
+
+    cpu = values("cpu_percent")
+    memory = values("memory_percent")
+    disk = values("disk_percent")
+    netin = values("network_in_rate")
+    netout = values("network_out_rate")
+    return {
+        "samples": len(samples),
+        "cpu_percent_avg": round(sum(cpu) / len(cpu), 2) if cpu else 0.0,
+        "cpu_percent_max": round(max(cpu), 2) if cpu else 0.0,
+        "memory_percent_avg": round(sum(memory) / len(memory), 2) if memory else 0.0,
+        "memory_percent_max": round(max(memory), 2) if memory else 0.0,
+        "disk_percent_max": round(max(disk), 2) if disk else 0.0,
+        "network_in_rate_max": max(netin) if netin else 0.0,
+        "network_out_rate_max": max(netout) if netout else 0.0,
+    }
+
+
+
+def _downsample_samples(
+    samples: list[Dict[str, Any]],
+    limit: int = _MAX_RRD_RETURNED_SAMPLES,
+) -> list[Dict[str, Any]]:
+    """Return an evenly-spaced bounded timeline while preserving endpoints.
+
+    The full RRD series remains available for aggregate calculations. Only the
+    timeline included in the model-facing tool result is bounded.
+    """
+    if limit <= 0 or not samples:
+        return []
+    if len(samples) <= limit:
+        return list(samples)
+    if limit == 1:
+        return [samples[-1]]
+
+    last = len(samples) - 1
+    indexes = [round(i * last / (limit - 1)) for i in range(limit)]
+    selected: list[Dict[str, Any]] = []
+    seen: set[int] = set()
+    for index in indexes:
+        if index in seen:
+            continue
+        seen.add(index)
+        selected.append(samples[index])
+    return selected
+
+
 async def _cluster_resources(
     integration: Dict[str, Any],
 ) -> tuple[list[Dict[str, Any]], Optional[str]]:
@@ -309,7 +435,8 @@ async def do_proxmox(
 
     resource_actions = {
         "status", "nodes", "guests", "storages",
-        "guest_status", "guest_config", "diagnostics",
+        "guest_status", "guest_config", "guest_details", "guest_metrics",
+        "diagnostics",
     }
     if action in resource_actions:
         resources, error = await _cluster_resources(integration)
@@ -350,7 +477,7 @@ async def do_proxmox(
             ],
         })
 
-    if action in {"guest_status", "guest_config"}:
+    if action in {"guest_status", "guest_config", "guest_details", "guest_metrics"}:
         guest, error = _resolve_guest(
             resources,
             args.get("guest") or args.get("vmid") or args.get("name"),
@@ -362,25 +489,78 @@ async def do_proxmox(
         kind = str(guest.get("type"))
         node = str(guest.get("node"))
         vmid = str(guest.get("vmid"))
-        suffix = "status/current" if action == "guest_status" else "config"
+        identity = _guest_identity(guest)
+
+        if action in {"guest_status", "guest_config"}:
+            suffix = "status/current" if action == "guest_status" else "config"
+            data, error = await _pve_get(
+                integration,
+                f"/api2/json/nodes/{node}/{kind}/{vmid}/{suffix}",
+            )
+            if error:
+                return {"error": error, "exit_code": 1}
+            return _json_result({
+                "action": action,
+                "guest": identity,
+                "data": _sanitize_config(data)
+                if action == "guest_config"
+                else data,
+            })
+
+        if action == "guest_details":
+            status, status_error = await _pve_get(
+                integration,
+                f"/api2/json/nodes/{node}/{kind}/{vmid}/status/current",
+            )
+            config, config_error = await _pve_get(
+                integration,
+                f"/api2/json/nodes/{node}/{kind}/{vmid}/config",
+            )
+            if status_error:
+                return {"error": status_error, "exit_code": 1}
+            if config_error:
+                return {"error": config_error, "exit_code": 1}
+            return _json_result({
+                "action": action,
+                "guest": identity,
+                "summary": _guest_status_summary(status),
+                "status": status,
+                "config": _sanitize_config(config),
+            })
+
+        timeframe = str(args.get("timeframe") or "day").strip().casefold()
+        if timeframe not in {"hour", "day", "week", "month", "year"}:
+            return {
+                "error": "timeframe must be hour, day, week, month, or year.",
+                "exit_code": 1,
+            }
+        consolidation = str(args.get("cf") or "AVERAGE").strip().upper()
+        if consolidation not in {"AVERAGE", "MAX"}:
+            return {"error": "cf must be AVERAGE or MAX.", "exit_code": 1}
         data, error = await _pve_get(
             integration,
-            f"/api2/json/nodes/{node}/{kind}/{vmid}/{suffix}",
+            f"/api2/json/nodes/{node}/{kind}/{vmid}/rrddata",
+            params={"timeframe": timeframe, "cf": consolidation},
         )
         if error:
             return {"error": error, "exit_code": 1}
-
+        raw_samples = data if isinstance(data, list) else []
+        samples = [
+            _rrd_sample_summary(sample)
+            for sample in raw_samples
+            if isinstance(sample, dict)
+        ]
+        returned_samples = _downsample_samples(samples)
         return _json_result({
             "action": action,
-            "guest": {
-                "vmid": guest.get("vmid"),
-                "name": guest.get("name"),
-                "type": kind,
-                "node": node,
-            },
-            "data": _sanitize_config(data)
-            if action == "guest_config"
-            else data,
+            "guest": identity,
+            "timeframe": timeframe,
+            "cf": consolidation,
+            "summary": _metric_summary(samples),
+            "sample_count": len(samples),
+            "returned_sample_count": len(returned_samples),
+            "timeline_downsampled": len(returned_samples) < len(samples),
+            "samples": returned_samples,
         })
 
     if action == "tasks":
@@ -517,8 +697,8 @@ async def do_proxmox(
 
     return {
         "error": (
-            "Unknown Proxmox action. Use status, nodes, guests, "
-            "guest_status, guest_config, storages, tasks, or diagnostics."
+            "Unknown Proxmox action. Use status, nodes, guests, guest_status, "
+            "guest_config, guest_details, guest_metrics, storages, tasks, or diagnostics."
         ),
         "exit_code": 1,
     }

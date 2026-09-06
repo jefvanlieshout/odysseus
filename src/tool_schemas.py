@@ -700,16 +700,36 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "proxmox",
-            "description": "Read-only Proxmox VE monitoring. Inspect nodes, VMs/LXCs, guest status/config, storage, tasks, or diagnostics. Never starts, stops, reboots, snapshots, or deletes anything.",
+            "description": "Read-only Proxmox VE monitoring. Inspect nodes, VMs/LXCs, rich guest details, guest RRD metrics/history, status/config, storage, tasks, or diagnostics. Never starts, stops, reboots, snapshots, or deletes anything.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "nodes", "guests", "guest_status", "guest_config", "storages", "tasks", "diagnostics"]
+                        "enum": ["status", "nodes", "guests", "guest_status", "guest_config", "guest_details", "guest_metrics", "storages", "tasks", "diagnostics"]
                     },
-                    "guest": {"type": "string", "description": "VMID or guest name for guest_status / guest_config"},
+                    "guest": {"type": "string", "description": "VMID or guest name for guest_status / guest_config / guest_details / guest_metrics"},
+                    "timeframe": {"type": "string", "enum": ["hour", "day", "week", "month", "year"], "description": "RRD history window for guest_metrics (default day)"},
+                    "cf": {"type": "string", "enum": ["AVERAGE", "MAX"], "description": "RRD consolidation function for guest_metrics (default AVERAGE)"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum recent tasks"}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kucoin_bot",
+            "description": "Read-only KuCoin grid-bot telemetry. Inspect bot status, persisted-anchor P&L/return/peak/drawdown, fill/fee counts, history, and diagnostics. Never fetches live market price and cannot place, cancel, or modify trades.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "performance", "activity", "diagnostics"]
+                    },
+                    "window": {"type": "string", "enum": ["day", "week", "month", "all"], "description": "History window for activity (default day)"}
                 },
                 "required": ["action"]
             }
