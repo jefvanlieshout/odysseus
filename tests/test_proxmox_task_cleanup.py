@@ -11,7 +11,7 @@ def _classify(text: str):
 
 def test_scoped_proxmox_tasks_do_not_seed_personal_task_domain():
     result = _classify(
-        "Gwen, check my Proxmox server. Give me a health overview of the node, "
+        "Atlas, check my Proxmox server. Give me a health overview of the node, "
         "running and stopped guests, storage usage, and any recent failed tasks."
     )
     assert "notes_calendar_tasks" not in result["domains"]

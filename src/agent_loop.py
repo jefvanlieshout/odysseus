@@ -594,9 +594,9 @@ _SELF_CODE_BYPASS_TOOLS = {
 }
 
 _SELF_CODE_RE = re.compile(
-    r"\b(?:gwen|odysseus)(?:[\'’]s)?\b.{0,80}\b(?:code|source|implementation|repo|repository|branch|commit)\b"
+    r"\b(?:atlas|gwen|odysseus)(?:[\'’]s)?\b.{0,80}\b(?:code|source|implementation|repo|repository|branch|commit)\b"
     r"|\b(?:your|your own|own)\b.{0,40}\b(?:code|source|implementation|repo|repository|branch|commit)\b"
-    r"|\b(?:inspect|read|search|check|show)\b.{0,50}\b(?:your|your own|gwen|odysseus)\b.{0,50}\b(?:code|source|implementation|repo|repository)\b"
+    r"|\b(?:inspect|read|search|check|show)\b.{0,50}\b(?:your|your own|atlas|gwen|odysseus)\b.{0,50}\b(?:code|source|implementation|repo|repository)\b"
     r"|\binspect[_ ]code\b",
     re.IGNORECASE,
 )

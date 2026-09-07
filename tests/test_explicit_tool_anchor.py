@@ -18,7 +18,7 @@ def test_explicit_proxmox_name_survives_tasks_domain():
     candidates = {"proxmox", "manage_tasks", "list_served_models"}
     named = explicitly_named_candidate_tools(
         (
-            "Gwen, check my Proxmox server. Give me running guests, "
+            "Atlas, check my Proxmox server. Give me running guests, "
             "storage usage, and recent failed tasks."
         ),
         candidates,

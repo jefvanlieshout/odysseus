@@ -479,7 +479,7 @@ def main() -> None:
         suggested_capabilities=broker_capabilities_for_domains({"email"}),
         domain_members=_test_domain_members,
         turn_text=(
-            "Gwen, check my Fastmail inbox. Show me my 5 newest emails and "
+            "Atlas, check my Fastmail inbox. Show me my 5 newest emails and "
             "briefly summarize each one. Do not modify anything."
         ),
         read_only_only=True,

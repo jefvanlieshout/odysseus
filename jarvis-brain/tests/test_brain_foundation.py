@@ -200,9 +200,9 @@ class BrainFoundationTests(unittest.TestCase):
         self.brain.capture_message(owner_id="other", external_session_ref="s2", external_message_ref="a1", role="assistant", content="hello")
 
     def test_identity_names_are_not_hardcoded_stopwords(self):
-        tokens = tokenize("Jef asked Gwen about Jarvis")
+        tokens = tokenize("Jef asked Atlas about Jarvis")
         self.assertIn("jef", tokens)
-        self.assertIn("gwen", tokens)
+        self.assertIn("atlas", tokens)
         self.assertIn("jarvis", tokens)
 
     def test_python_derives_provenance_grounding(self):

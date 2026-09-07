@@ -1,6 +1,6 @@
 # KuCoin grid-bot telemetry sidecar
 
-Read-only telemetry bridge for Gwen/Odysseus.
+Read-only telemetry bridge for Atlas/Odysseus.
 
 - Reads `/etc/kucoin-grid-bot/config.yaml` and the configured `state_file`.
 - Never talks to KuCoin.

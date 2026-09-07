@@ -252,7 +252,7 @@ def _diff(root: Path, path: Path | None, *, staged: bool) -> Dict[str, Any]:
     return {"staged": bool(staged), "diff": text, "truncated": truncated}
 
 async def do_inspect_code(content: str, owner: str | None = None) -> Dict[str, Any]:
-    """Read-only inspection of the real Odysseus/Gwen repository."""
+    """Read-only inspection of the real Odysseus/Atlas repository."""
     del owner
     try:
         args = _parse_tool_args(content) if str(content or "").strip() else {}

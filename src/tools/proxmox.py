@@ -1,4 +1,4 @@
-"""Read-only Proxmox VE monitoring tool for Gwen."""
+"""Read-only Proxmox VE monitoring tool for Atlas."""
 
 from __future__ import annotations
 

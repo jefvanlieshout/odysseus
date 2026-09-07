@@ -15,7 +15,7 @@ def test_downsample_samples_bounds_rrd_but_keeps_endpoints():
 def test_context_trim_preserves_latest_user_and_tool_exchange():
     user_text = "Summarize LXC 109 resource usage over the last day."
     messages = [
-        {"role": "system", "content": "You are Gwen."},
+        {"role": "system", "content": "You are Atlas."},
         {"role": "user", "content": user_text},
         {
             "role": "assistant",

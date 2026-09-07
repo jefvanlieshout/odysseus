@@ -124,4 +124,4 @@ Still intentionally deferred:
 - no Odysseus `MEMORY_BACKEND=jarvis_brain` switch;
 - no current `memory.json` import;
 - no old `jarvis.db` import;
-- no Brain-derived context injection into Gwen yet (planned recall milestone).
+- no Brain-derived context injection into Atlas yet (planned recall milestone).

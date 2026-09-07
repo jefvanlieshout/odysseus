@@ -455,7 +455,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "inspect_code",
-            "description": "Read-only inspection of Gwen/Odysseus' real host source repository. Use this to inspect your own implementation instead of guessing. Supports repository status, tree browsing, text search, bounded file reads, and git diff. Cannot write files or run arbitrary commands; secrets/runtime data are blocked.",
+            "description": "Read-only inspection of Atlas/Odysseus' real host source repository. Use this to inspect your own implementation instead of guessing. Supports repository status, tree browsing, text search, bounded file reads, and git diff. Cannot write files or run arbitrary commands; secrets/runtime data are blocked.",
             "parameters": {
                 "type": "object",
                 "properties": {

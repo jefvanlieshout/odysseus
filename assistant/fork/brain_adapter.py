@@ -528,21 +528,21 @@ class BrainMemoryAdapter:
             payload["text"] = lines[1].strip()
             payload["memory_type"] = lines[2].strip().casefold() if len(lines) > 2 and lines[2].strip() else "fact"
             payload["external_source_ref"] = f"gwen-control-add-{uuid.uuid4()}"
-            payload["reason"] = "Explicit memory add requested through Gwen."
+            payload["reason"] = "Explicit memory add requested through Atlas."
         elif action == "edit":
             if len(lines) < 3 or not lines[1].strip() or not lines[2].strip():
                 return {"error": "Edit needs line 2: memory_id, line 3: new text"}
             payload["memory_ref"] = lines[1].strip()
             payload["text"] = lines[2].strip()
             payload["external_source_ref"] = f"gwen-control-edit-{uuid.uuid4()}"
-            payload["reason"] = "Explicit memory edit requested through Gwen."
+            payload["reason"] = "Explicit memory edit requested through Atlas."
         elif action in {"delete", "forget"}:
             if len(lines) < 2 or not lines[1].strip():
                 return {"error": "Delete needs line 2: memory_id"}
             payload["action"] = "forget"
             payload["memory_ref"] = lines[1].strip()
             payload["external_source_ref"] = f"gwen-control-forget-{uuid.uuid4()}"
-            payload["reason"] = "Explicit memory forget requested through Gwen."
+            payload["reason"] = "Explicit memory forget requested through Atlas."
         else:
             return {"error": "Brain memory action must be list, search, history, add, edit, delete, or forget"}
         request_result, decoded = self._post_json_payload(

@@ -37,7 +37,7 @@ This foundation is reconstructed from two authoritative ancestors:
 ## Audit findings fixed before live integration
 
 The first isolated slice passed its original tests, but review found several issues that were
-safe while isolated and unacceptable once connected to Gwen:
+safe while isolated and unacceptable once connected to Atlas:
 
 - it preserved user observations but not the *entire* conversation transcript
 - duplicate external IDs with changed content were silently treated as normal retries
@@ -67,5 +67,5 @@ Still deferred:
 
 - replacing Odysseus' native memory backend;
 - importing current `memory.json` / old `jarvis.db`;
-- Brain recall/context injection into Gwen;
+- Brain recall/context injection into Atlas;
 - broader episodic maintenance/decay policy.

@@ -62,7 +62,7 @@ services:
       BRAIN_CHROMA_SEMANTIC_COLLECTION: jarvis_brain_shadow_semantic_v1
       BRAIN_CHROMA_EPISODIC_COLLECTION: jarvis_brain_shadow_episodic_v1
 
-      # Brain's analyzer is intentionally independent from Gwen's current chat model.
+      # Brain's analyzer is intentionally independent from Atlas's current chat model.
       # The worker shares Odysseus' network namespace so 127.0.0.1 reaches the
       # same local OpenAI-compatible endpoint proven by the live CREATE/MATCH gates.
       BRAIN_LLM_URL: ${BRAIN_LLM_URL:-http://127.0.0.1:8000/v1/chat/completions}

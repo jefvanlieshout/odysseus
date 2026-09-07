@@ -1,4 +1,4 @@
-"""Read-only KuCoin grid-bot telemetry tool for Gwen."""
+"""Read-only KuCoin grid-bot telemetry tool for Atlas."""
 
 from __future__ import annotations
 

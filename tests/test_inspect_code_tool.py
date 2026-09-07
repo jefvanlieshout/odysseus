@@ -59,7 +59,7 @@ def test_native_inspect_code_call_converts():
 
 def test_self_code_intent_is_narrow():
     from src.agent_loop import _looks_like_self_code_request
-    assert _looks_like_self_code_request("Gwen, inspect your own source code")
+    assert _looks_like_self_code_request("Atlas, inspect your own source code")
     assert _looks_like_self_code_request("run inspect code for me")
     assert _looks_like_self_code_request("what commit is your own code on?")
     assert _looks_like_self_code_request("show me Odysseus implementation")
