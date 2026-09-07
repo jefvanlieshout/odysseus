@@ -8,8 +8,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
-RUN useradd --system --uid 10001 --create-home bridge && chown -R bridge:bridge /app
+COPY bot.py voice.py interactions.py ./
+RUN useradd --system --uid 10001 --create-home bridge \
+    && mkdir -p /state \
+    && chown -R bridge:bridge /app /state
 
 USER bridge
 CMD ["python", "bot.py"]

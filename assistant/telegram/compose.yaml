@@ -1,12 +1,41 @@
 services:
+  chatterbox-nano-tts:
+    build:
+      context: ./chatterbox
+    container_name: odysseus-chatterbox-nano-tts
+    restart: unless-stopped
+    networks:
+      - odysseus
+    environment:
+      CHATTERBOX_VOICE_REFERENCE: /voice/reference.wav
+      CHATTERBOX_MAX_CHARS: ${TTS_MAX_CHARS:-4000}
+      OMP_NUM_THREADS: "8"
+      MKL_NUM_THREADS: "8"
+    volumes:
+      - "${TTS_VOICE_REFERENCE_PATH:?Set TTS_VOICE_REFERENCE_PATH in .env}:/voice/reference.wav:ro"
+      - chatterbox-hf-cache:/root/.cache/huggingface
+    cpus: 8.0
+    mem_limit: 6g
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   telegram-bridge:
     build: .
     container_name: odysseus-telegram-bridge
     restart: unless-stopped
     env_file:
       - .env
+    depends_on:
+      - chatterbox-nano-tts
     networks:
       - odysseus
+    volumes:
+      - telegram-bridge-state:/state
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -14,6 +43,10 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  telegram-bridge-state:
+  chatterbox-hf-cache:
 
 networks:
   odysseus:

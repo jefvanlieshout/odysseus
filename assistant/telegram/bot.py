@@ -7,9 +7,32 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import httpx
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from interactions import decode_callback, interaction_keyboard, interaction_text, normalize_interaction
+
+def _telegram_keyboard(markup):
+    if markup is None:
+        return None
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    text=button.text,
+                    callback_data=button.callback_data,
+                )
+                for button in row
+            ]
+            for row in markup.inline_keyboard
+        ]
+    )
+
+
+
+from voice import VoiceModeStore, normalize_voice_mode, should_synthesize
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -17,6 +40,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("odysseus-telegram-bridge")
+# Telegram embeds the bot token in API request URLs. Keep HTTP transport
+# logging below INFO so normal logs cannot expose the token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def env_required(name: str) -> str:
@@ -60,12 +87,35 @@ WHISPER_TIMEOUT_SECONDS = float(os.getenv("WHISPER_TIMEOUT_SECONDS", "120"))
 WHISPER_MAX_AUDIO_BYTES = int(os.getenv("WHISPER_MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))
 WHISPER_MAX_VOICE_SECONDS = float(os.getenv("WHISPER_MAX_VOICE_SECONDS", "600"))
 TELEGRAM_ECHO_TRANSCRIPT = env_bool("TELEGRAM_ECHO_TRANSCRIPT", False)
+TTS_ENABLED = env_bool("TTS_ENABLED", True)
+TTS_URL = os.getenv(
+    "TTS_URL", "http://chatterbox-nano-tts:8881/v1/audio/speech"
+).strip()
+TTS_MODEL = os.getenv("TTS_MODEL", "chatterbox-nano").strip() or "chatterbox-nano"
+TTS_VOICE = os.getenv("TTS_VOICE", "reference").strip() or "reference"
+TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
+TTS_TIMEOUT_SECONDS = float(os.getenv("TTS_TIMEOUT_SECONDS", "120"))
+TTS_MAX_CHARS = max(1, int(os.getenv("TTS_MAX_CHARS", "4000")))
+TTS_MAX_AUDIO_BYTES = max(
+    1, int(os.getenv("TTS_MAX_AUDIO_BYTES", str(20 * 1024 * 1024)))
+)
+TELEGRAM_VOICE_DEFAULT = normalize_voice_mode(
+    os.getenv("TELEGRAM_VOICE_DEFAULT", "auto"), fallback="auto"
+)
+TELEGRAM_VOICE_STATE_FILE = os.getenv(
+    "TELEGRAM_VOICE_STATE_FILE", "/state/voice_modes.json"
+).strip()
 ALLOWED_USERS = parse_allowed_users(os.getenv("TELEGRAM_ALLOWED_USER_IDS", ""))
 
 _http: Optional[httpx.AsyncClient] = None
 _whisper_http: Optional[httpx.AsyncClient] = None
+_tts_http: Optional[httpx.AsyncClient] = None
 _resolved_session_id: Optional[str] = ODYSSEUS_SESSION_ID or None
 _session_lock = asyncio.Lock()
+_voice_modes = VoiceModeStore(
+    TELEGRAM_VOICE_STATE_FILE,
+    default=TELEGRAM_VOICE_DEFAULT,
+)
 
 
 def is_allowed(update: Update) -> bool:
@@ -114,6 +164,14 @@ async def whisper_http_client() -> httpx.AsyncClient:
     return _whisper_http
 
 
+async def tts_http_client() -> httpx.AsyncClient:
+    global _tts_http
+    if _tts_http is None:
+        # TTS is deliberately isolated from Odysseus auth/tool credentials.
+        _tts_http = httpx.AsyncClient(timeout=httpx.Timeout(TTS_TIMEOUT_SECONDS))
+    return _tts_http
+
+
 def telegram_duration_seconds(value) -> float:
     if value is None:
         return 0.0
@@ -142,6 +200,82 @@ async def whisper_transcribe(audio: bytes, filename: str = "voice.ogg", content_
         raise RuntimeError("Whisper returned no transcript")
     result["text"] = text.strip()
     return result
+
+
+async def synthesize_speech(text: str) -> bytes:
+    if not TTS_ENABLED:
+        raise RuntimeError("TTS TTS is disabled")
+    clean = text.strip()
+    if not clean:
+        raise RuntimeError("Cannot synthesize an empty response")
+    if len(clean) > TTS_MAX_CHARS:
+        raise ValueError(
+            f"response has {len(clean)} chars; TTS limit is {TTS_MAX_CHARS}"
+        )
+
+    client = await tts_http_client()
+    response = await client.post(
+        TTS_URL,
+        json={
+            "model": TTS_MODEL,
+            "input": clean,
+            "voice": TTS_VOICE,
+            "response_format": "ogg",
+            "speed": TTS_SPEED,
+        },
+        headers={"Accept": "audio/ogg"},
+    )
+    response.raise_for_status()
+    audio = response.content
+    if not audio:
+        raise RuntimeError("TTS returned an empty audio response")
+    if len(audio) > TTS_MAX_AUDIO_BYTES:
+        raise RuntimeError(
+            f"TTS audio response is too large ({len(audio)} bytes)"
+        )
+    return audio
+
+
+async def maybe_send_voice_reply(
+    update: Update,
+    answer: str,
+    *,
+    input_was_voice: bool,
+) -> None:
+    # Best-effort rendering of an already-final text answer.
+    if update.message is None or update.effective_chat is None:
+        return
+
+    mode = _voice_modes.get(update.effective_chat.id)
+    if not TTS_ENABLED or not should_synthesize(
+        mode, input_was_voice=input_was_voice
+    ):
+        return
+
+    if len(answer.strip()) > TTS_MAX_CHARS:
+        logger.info(
+            "Skipping TTS: response chars=%d exceeds limit=%d",
+            len(answer.strip()),
+            TTS_MAX_CHARS,
+        )
+        return
+
+    try:
+        await update.effective_chat.send_action(ChatAction.RECORD_VOICE)
+        audio = await synthesize_speech(answer)
+        await update.message.reply_voice(
+            voice=InputFile(audio, filename="atlas.ogg")
+        )
+        logger.info(
+            "Sent TTS voice reply chat_id=%s mode=%s source=%s bytes=%d",
+            update.effective_chat.id,
+            mode,
+            "voice" if input_was_voice else "text",
+            len(audio),
+        )
+    except Exception as exc:
+        # Text has already been delivered. TTS failure is intentionally non-fatal.
+        logger.warning("TTS voice reply failed: %s", exc, exc_info=True)
 
 
 async def resolve_session_id(force: bool = False) -> str:
@@ -182,7 +316,7 @@ async def resolve_session_id(force: bool = False) -> str:
     return _resolved_session_id
 
 
-async def _odysseus_agent_stream(message: str, session_id: str) -> tuple[int, str, str]:
+async def _odysseus_agent_stream(message: str, session_id: str) -> tuple[int, str, str, object | None]:
     """Run the full Odysseus SSE agent loop and return status, final text, raw error body."""
     client = await http_client()
     form = {
@@ -199,6 +333,7 @@ async def _odysseus_agent_stream(message: str, session_id: str) -> tuple[int, st
 
     full_response: list[str] = []
     last_tool_output = ""
+    interaction = None
 
     async with client.stream(
         "POST",
@@ -208,7 +343,7 @@ async def _odysseus_agent_stream(message: str, session_id: str) -> tuple[int, st
     ) as response:
         if response.status_code >= 400:
             raw = (await response.aread()).decode(errors="replace")
-            return response.status_code, "", raw
+            return response.status_code, "", raw, None
 
         async for line in response.aiter_lines():
             if not line.startswith("data: "):
@@ -253,35 +388,43 @@ async def _odysseus_agent_stream(message: str, session_id: str) -> tuple[int, st
             }:
                 logger.warning("Odysseus agent event: %s %s", event_type, event)
             elif event_type == "ask_user":
-                # Current V1 bridge cannot render Odysseus UI buttons. Preserve the
-                # question as text so the user can reply naturally in Telegram.
-                question = event.get("question") or event.get("message")
-                if isinstance(question, str) and question.strip():
-                    full_response.append(question.strip())
+                parsed = normalize_interaction(event)
+                if parsed is not None:
+                    interaction = parsed
+            elif event_type in {
+                "approval_request",
+                "approval_required",
+                "confirm_action",
+                "confirmation_required",
+                "requires_confirmation",
+            }:
+                parsed = normalize_interaction(event)
+                if parsed is not None:
+                    interaction = parsed
 
     answer = "".join(full_response).strip()
-    if not answer and last_tool_output:
+    if not answer and last_tool_output and interaction is None:
         answer = last_tool_output
-    if not answer:
+    if not answer and interaction is None:
         answer = "Odysseus finished the agent run but returned no text response."
-    return 200, answer, ""
+    return 200, answer, "", interaction
 
 
-async def odysseus_chat(message: str) -> str:
+async def odysseus_chat(message: str) -> tuple[str, object | None]:
     session_id = await resolve_session_id()
 
     if ODYSSEUS_AGENT_MODE:
-        status, answer, raw_error = await _odysseus_agent_stream(message, session_id)
+        status, answer, raw_error, interaction = await _odysseus_agent_stream(message, session_id)
         if status == 404 and not ODYSSEUS_SESSION_ID:
             session_id = await resolve_session_id(force=True)
-            status, answer, raw_error = await _odysseus_agent_stream(message, session_id)
+            status, answer, raw_error, interaction = await _odysseus_agent_stream(message, session_id)
         if status >= 400:
             request = httpx.Request("POST", f"{ODYSSEUS_URL}/api/chat_stream")
             response = httpx.Response(status, text=raw_error, request=request)
             raise httpx.HTTPStatusError(
                 f"Odysseus returned HTTP {status}", request=request, response=response
             )
-        return answer
+        return answer, interaction
 
     client = await http_client()
     payload = {
@@ -311,7 +454,7 @@ async def odysseus_chat(message: str) -> str:
     answer = response.json().get("response")
     if not isinstance(answer, str) or not answer.strip():
         raise RuntimeError("Odysseus returned no text response")
-    return answer.strip()
+    return answer.strip(), None
 
 
 def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
@@ -334,6 +477,52 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+async def interaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or not is_allowed(update):
+        return
+
+    decoded = decode_callback(query.data or "")
+    if decoded is None:
+        await query.answer("This choice is no longer valid.")
+        return
+
+    interaction_id, index = decoded
+    markup = query.message.reply_markup if query.message is not None else None
+    buttons = []
+    if markup is not None:
+        for row in markup.inline_keyboard:
+            buttons.extend(row)
+
+    matches = [
+        button for button in buttons
+        if decode_callback(button.callback_data or "") == (interaction_id, index)
+    ]
+    if not matches:
+        await query.answer("This choice is no longer valid.", show_alert=True)
+        return
+
+    selected = matches[0].text.strip()
+    await query.answer(f"Selected: {selected}")
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        logger.debug("Could not clear interaction buttons", exc_info=True)
+
+    answer, interaction = await odysseus_chat(selected)
+
+    if query.message is not None:
+        if answer.strip():
+            for chunk in split_message(answer):
+                await query.message.reply_text(chunk)
+        if interaction is not None:
+            await query.message.reply_text(
+                interaction_text(interaction),
+                reply_markup=_telegram_keyboard(interaction_keyboard(interaction)),
+            )
 
 
 async def typing_loop(update: Update, stop: asyncio.Event) -> None:
@@ -433,6 +622,42 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Odysseus status check failed: {exc}")
 
 
+async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_chat is None:
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("Not authorized. Use /whoami to get your user ID.")
+        return
+
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        mode = _voice_modes.get(chat_id)
+        await update.message.reply_text(
+            f"Voice replies: {mode}\n"
+            "auto = voice only after a voice note\n"
+            "on = voice after text and voice input\n"
+            "off = text only"
+        )
+        return
+
+    if len(args) != 1:
+        await update.message.reply_text("Usage: /voice [auto|on|off]")
+        return
+
+    try:
+        mode = _voice_modes.set(chat_id, args[0])
+    except ValueError:
+        await update.message.reply_text("Usage: /voice [auto|on|off]")
+        return
+    except OSError as exc:
+        logger.exception("Could not persist Telegram voice mode")
+        await update.message.reply_text(f"Could not save the voice preference: {exc}")
+        return
+
+    await update.message.reply_text(f"Voice replies set to: {mode}")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -440,20 +665,32 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start - bridge status/setup hint\n"
         "/whoami - show your Telegram IDs\n"
         "/status - check Odysseus session/model/mode\n"
+        "/voice [auto|on|off] - control TTS voice replies\n"
         "/help - show help\n\n"
         "Normal text and Telegram voice notes are sent to Odysseus. Voice notes are transcribed locally first. "
+        "Voice replies are rendered only after the final text response; text remains the primary response. "
         "In agent mode, Odysseus can use its enabled tools."
     )
 
 
-async def run_prompt_and_reply(update: Update, text: str) -> None:
+async def run_prompt_and_reply(
+    update: Update,
+    text: str,
+    *,
+    input_was_voice: bool = False,
+) -> None:
     if update.message is None:
         return
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(typing_loop(update, stop_typing))
     try:
-        answer = await odysseus_chat(text)
+        answer, interaction = await odysseus_chat(text)
+        if interaction is not None:
+            await update.effective_message.reply_text(
+                interaction_text(interaction),
+                reply_markup=_telegram_keyboard(interaction_keyboard(interaction)),
+            )
     except httpx.HTTPStatusError as exc:
         logger.exception(
             "Odysseus HTTP error status=%s body=%r",
@@ -478,6 +715,11 @@ async def run_prompt_and_reply(update: Update, text: str) -> None:
 
     for chunk in split_message(answer):
         await update.message.reply_text(chunk)
+
+    # Voice is downstream and best-effort; the complete text is already sent.
+    await maybe_send_voice_reply(
+        update, answer, input_was_voice=input_was_voice
+    )
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -537,7 +779,12 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.message.reply_text(f"🎤 Heard: {transcript}")
 
             # The transcript enters the exact same Odysseus agent path as typed text.
-            answer = await odysseus_chat(transcript)
+            answer, interaction = await odysseus_chat(transcript)
+            if interaction is not None:
+                await update.effective_message.reply_text(
+                    interaction_text(interaction),
+                    reply_markup=_telegram_keyboard(interaction_keyboard(interaction)),
+                )
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:500] if exc.response is not None else ""
             logger.exception(
@@ -569,6 +816,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for chunk in split_message(answer):
             await update.message.reply_text(chunk)
 
+        # In auto mode this is the path that speaks back.
+        await maybe_send_voice_reply(update, answer, input_was_voice=True)
+
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or not update.message.text:
@@ -594,11 +844,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(application: Application) -> None:
     logger.info(
-        "Telegram bridge starting; Odysseus URL=%s mode=%s timezone=%s Whisper=%s",
+        "Telegram bridge starting; Odysseus URL=%s mode=%s timezone=%s Whisper=%s TTS=%s voice_default=%s",
         ODYSSEUS_URL,
         "agent" if ODYSSEUS_AGENT_MODE else "chat",
         ODYSSEUS_TZ_NAME or "default",
         WHISPER_URL if WHISPER_ENABLED else "disabled",
+        TTS_URL if TTS_ENABLED else "disabled",
+        TELEGRAM_VOICE_DEFAULT,
     )
     if ALLOWED_USERS:
         logger.info("Allowed Telegram user IDs: %s", sorted(ALLOWED_USERS))
@@ -612,13 +864,16 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    global _http, _whisper_http
+    global _http, _whisper_http, _tts_http
     if _http is not None:
         await _http.aclose()
         _http = None
     if _whisper_http is not None:
         await _whisper_http.aclose()
         _whisper_http = None
+    if _tts_http is not None:
+        await _tts_http.aclose()
+        _tts_http = None
 
 
 def main() -> None:
@@ -632,7 +887,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("voice", cmd_voice))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(interaction_callback, pattern=r"^odyask:"))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)

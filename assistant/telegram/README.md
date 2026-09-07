@@ -1,94 +1,53 @@
 # Odysseus Telegram Bridge
 
-Standalone V1 bridge:
+Telegram text/voice -> bridge -> local Whisper -> Odysseus -> text reply
+-> optional local Chatterbox Nano voice reply.
 
-    Telegram -> bridge -> Odysseus /api/chat -> your selected Odysseus model
+The bridge uses Telegram long polling, so no inbound port or webhook is needed.
 
-It uses Telegram long polling, so no inbound port or webhook is needed.
+## Voice
 
-## 1. Create the Odysseus chat
+Commands:
 
-Create a normal Odysseus chat named exactly:
+    /voice
+    /voice auto
+    /voice on
+    /voice off
 
-    Telegram Jarvis
+- `auto`: voice-in gets text + voice-out; typed input gets text only.
+- `on`: text + voice for successful replies.
+- `off`: text only.
 
-Select Qwen3.8-27B (or whichever model you want) and send one test message in the UI.
+Outgoing voice replies use CPU-only Chatterbox Nano and Telegram-native
+OGG/Opus. TTS failure never suppresses the text reply.
 
-## 2. Configure
+The reference WAV is intentionally not committed. Set its local path in `.env`:
 
-    cp .env.example .env
-    nano .env
+    TTS_VOICE_REFERENCE_PATH=/absolute/path/to/atlas-reference.wav
 
-Fill in:
-
-    TELEGRAM_BOT_TOKEN=...
-    ODYSSEUS_API_TOKEN=ody_...
-
-You can leave TELEGRAM_ALLOWED_USER_IDS empty for the first boot.
-
-## 3. Check the Odysseus network
-
-From your Odysseus checkout:
-
-    cd ~/odysseus/odysseus
-    docker inspect "$(docker compose ps -q odysseus)" \
-      --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{"\\n"}}{{end}}'
-
-Usually it is:
-
-    odysseus_default
-
-If yours differs, put the returned name in ODYSSEUS_NETWORK in `.env`.
-
-## 4. Start
-
-From this bridge directory:
+## Start
 
     docker compose up -d --build
 
-Logs:
+Containers:
 
-    docker compose logs -f
+- `odysseus-telegram-bridge`
+- `odysseus-chatterbox-nano-tts`
 
-## 5. Get your Telegram user ID
-
-Message your new bot:
-
-    /whoami
-
-Put the returned numeric ID into `.env`:
-
-    TELEGRAM_ALLOWED_USER_IDS=123456789
-
-Then:
-
-    docker compose restart
-
-Now normal messages are accepted.
-
-## Commands
-
-    /start
-    /whoami
-    /status
-    /help
+Chatterbox Nano is capped at 8 CPUs / 6 GB RAM and receives no GPU.
 
 ## Security
 
-- No ports are published by the bridge.
-- Normal messages are allowlist-only.
-- The container is non-root.
-- All Linux capabilities are dropped.
-- Root filesystem is read-only.
-- Keep `.env` private: it contains your Telegram and Odysseus tokens.
+- No bridge/TTS ports are published.
+- Telegram messages are allowlist-only.
+- The bridge is non-root with a read-only root filesystem.
+- The voice reference is mounted read-only.
+- Odysseus credentials are not sent to Whisper/TTS.
+- `httpx` and `httpcore` INFO logs are suppressed because Telegram embeds the
+  bot token in API request URLs.
+- Keep `.env` private.
 
 ## Troubleshooting
 
-If session-name lookup fails, set the exact session UUID:
-
-    ODYSSEUS_SESSION_ID=<uuid>
-
-If you get 401/403, check that the `ody_...` token is active, has chat scope,
-and belongs to the same Odysseus account that owns the Telegram Jarvis chat.
-
-If `odysseus` does not resolve, the bridge is on the wrong Docker network.
+    docker compose ps
+    docker compose logs --tail=100 telegram-bridge chatterbox-nano-tts
