@@ -388,9 +388,11 @@ class ChatProcessor:
             except Exception as e:
                 logger.warning(f"RAG retrieval failed: {e}")
 
-        # Add web search if enabled
+        # Add legacy automatic web search only in plain chat mode.
+        # Agent mode has native web tools and must route web access through
+        # the agent/tool-policy path instead of prefetching before the agent runs.
         web_sources = []
-        if use_web:
+        if use_web and not agent_mode:
             try:
                 from src.llm_core import llm_call
 

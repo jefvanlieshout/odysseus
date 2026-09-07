@@ -18,12 +18,23 @@ from src.context_compactor import maybe_compact, trim_for_context
 from src.model_context import estimate_tokens, get_context_length
 from src.auth_helpers import effective_user
 from src.prompt_security import untrusted_context_message
+from src.tool_policy import tool_toggle_enabled
 from src.attachment_refs import attachment_ref
 from routes.prefs_routes import _load_for_user as load_prefs_for_user
 
 from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
+
+
+def _legacy_web_prefetch_enabled(use_web: object, agent_mode: bool) -> bool:
+    """Allow legacy chat prefetch only for an explicit true toggle in chat mode.
+
+    Streaming form fields arrive as strings, so bool("false") is True.
+    Agent mode has native web tools and must never run this legacy prefetch path.
+    """
+    return tool_toggle_enabled(use_web) and not agent_mode
+
 
 _CASUAL_OPENING_RE = re.compile(
     r"^\s*(?:h+i+|hey+|hello+|yo+|sup+|what'?s up|wass?up|hiya|howdy|"
@@ -780,6 +791,12 @@ async def build_chat_context(
     if incognito or not allow_tool_preprocessing or is_research_spinoff or casual_low_signal:
         use_rag_val = False
 
+    # Legacy automatic web prefetch belongs to plain chat mode only.
+    # Form fields may contain the literal string "false", which is truthy in
+    # Python; normalize it through the same explicit toggle semantics used by
+    # the agent tool policy. Agent mode uses native web_search/web_fetch tools.
+    legacy_web_prefetch = _legacy_web_prefetch_enabled(use_web, agent_mode)
+
     # If pre-fetched search context was provided (compare mode), skip live web search
     skip_web = bool(search_context) or not allow_tool_preprocessing or casual_low_signal
 
@@ -798,7 +815,7 @@ async def build_chat_context(
     _preface_kwargs = dict(
         message=_ctx_msg,
         session=sess,
-        use_web=use_web and not skip_web,
+        use_web=legacy_web_prefetch and not skip_web,
         use_memory=mem_enabled,
         time_filter=time_filter,
         preset_system_prompt=preset.system_prompt,
